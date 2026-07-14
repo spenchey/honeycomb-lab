@@ -139,8 +139,26 @@ model (embedding models are skipped).
 
 Endpoints: `/v1/chat/completions` · `/v1/completions` · `/v1/embeddings`
 (all proxied, stream + non-stream) · `/health` (backends, activity,
-stats) · `/nodes` (fleet status for the dashboard) · `/requests` (recent
-traffic) · `/control/*` (ping / doctor / container — see security below).
+telemetry) · `/telemetry` (accounted usage by agent, alias, model, and
+device) · `/nodes` (fleet status for the dashboard) · `/requests` (recent
+traffic) · `/control/*` (ping / doctor / container / configured pair mode —
+see security below).
+
+### Telemetry
+
+Honeycomb records each routed request by the authenticated agent token, route
+alias, resolved model, and configured device. Token totals are counted only
+when the upstream model returns a `usage` object; streamed usage can be
+enabled per backend with `"stream_usage": true`. The dashboard's **ACCOUNTED
+USAGE** strip shows the same data without estimating missing tokens. Spark
+nodes show GPU, memory, and CPU through SSH; an HTTP-only endpoint can also
+provide CPU by adding `sshHost` and `metricsCommand` to its fleet entry.
+
+An agent should point at a stable Honeycomb alias such as `dev-local`, not a
+hardware URL. The alias is the centrally managed routing policy; it maps to a
+specific model/device and can have an explicit fallback. Changing a physically
+loaded model is intentionally a separate configured operation, because it
+stops and reloads the serving process.
 
 ## fleet.json
 

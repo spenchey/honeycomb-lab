@@ -96,23 +96,28 @@ def _http_models(base_url: str, models_path: str) -> tuple[bool, list[str], floa
         return False, [], None
 
 
-def _ssh_metrics(host: str) -> dict[str, Any] | None:
-    cmd = (
-        "free -m | awk '/^Mem:/{print $3, $2}'; "
-        "nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits"
+def _ssh_metrics(host: str, custom_command: str | None = None) -> dict[str, Any] | None:
+    cmd = custom_command or (
+        "free -m | awk '/^Mem:/{print \"MEM \" $3 \" \" $2}'; "
+        "LC_ALL=C top -bn1 | awk -F, '/^%Cpu/{for(i=1;i<=NF;i++) if($i ~ / id/){gsub(/[^0-9.]/,\"\",$i); print \"CPU \" 100-$i; exit}}'; "
+        "nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | awk '{print \"GPU \" $1}'"
     )
     code, out = _run(["ssh", *SSH_OPTS, "--", host, cmd], timeout=7)
     if code != 0:
         return None
     lines = [l.strip() for l in out.splitlines() if l.strip()]
     metrics: dict[str, Any] = {}
-    if lines:
-        parts = lines[0].split()
-        if len(parts) == 2 and all(p.isdigit() for p in parts):
-            metrics["memUsedMB"] = int(parts[0])
-            metrics["memTotalMB"] = int(parts[1])
-    if len(lines) > 1 and lines[1].lstrip("-").isdigit():
-        metrics["gpuUtilPct"] = int(lines[1])
+    for line in lines:
+        parts = line.split()
+        if len(parts) == 3 and parts[0] == "MEM" and all(p.replace(".", "", 1).isdigit() for p in parts[1:]):
+            metrics["memUsedMB"] = int(float(parts[1]))
+            metrics["memTotalMB"] = int(float(parts[2]))
+        elif len(parts) == 2 and parts[0] == "CPU":
+            try: metrics["cpuUtilPct"] = round(float(parts[1]), 1)
+            except ValueError: pass
+        elif len(parts) == 2 and parts[0] == "GPU":
+            try: metrics["gpuUtilPct"] = round(float(parts[1]), 1)
+            except ValueError: pass
     return metrics or None
 
 
@@ -156,7 +161,7 @@ def _probe_vllm_ssh(node: dict[str, Any]) -> dict[str, Any]:
         ssh_ok = code == 0
     infer_ok, models, latency = _http_models(node["baseURL"], node.get("modelsPath", "/v1/models"))
 
-    metrics = _ssh_metrics(host) if (host and ssh_ok) else None
+    metrics = _ssh_metrics(host, node.get("metricsCommand")) if (host and ssh_ok) else None
     if infer_ok:
         vm = _vllm_metrics(node["baseURL"])
         if vm:
@@ -242,13 +247,18 @@ def _probe_lmlink_peer(node: dict[str, Any]) -> dict[str, Any]:
 
 def _probe_http_only(node: dict[str, Any]) -> dict[str, Any]:
     infer_ok, models, latency = _http_models(node["baseURL"], node.get("modelsPath", "/v1/models"))
+    metrics = None
+    if node.get("sshHost"):
+        code, _ = _run(["ssh", *SSH_OPTS, "--", node["sshHost"], "echo", "ok"], timeout=6)
+        if code == 0:
+            metrics = _ssh_metrics(node["sshHost"], node.get("metricsCommand"))
     return {
         "health": "online" if infer_ok else "offline",
         "models": models,
         "inferenceOK": infer_ok,
         "detail": "api" if infer_ok else "API not answering",
         "latencyMs": latency,
-        "metrics": None,
+        "metrics": metrics,
         "pathBadge": "API" if infer_ok else "DOWN",
     }
 

@@ -87,11 +87,15 @@ ACTIVE_WINDOW_SEC = 8.0
 _requests_lock = threading.Lock()
 _request_log: collections.deque[dict[str, Any]] = collections.deque(maxlen=50)
 
-# Per-alias cumulative stats, persisted to stats.json (thread-safe)
+# Cumulative telemetry, persisted to stats.json. Each successful or failed
+# gateway request is accounted for by agent, route, model, and device. We only
+# count tokens when the upstream API actually reported them; no estimates.
 STATS_PATH = ROOT / "stats.json"
 STATS_WRITE_INTERVAL_SEC = 30.0
 _stats_lock = threading.Lock()
-_stats: dict[str, dict[str, Any]] = {}
+_stats: dict[str, dict[str, dict[str, Any]]] = {
+    "by_agent": {}, "by_alias": {}, "by_model": {}, "by_device": {}
+}
 _stats_last_write = 0.0
 
 
@@ -101,7 +105,16 @@ def _load_stats() -> None:
         with STATS_PATH.open() as f:
             data = json.load(f)
         if isinstance(data, dict):
-            _stats = data
+            # Migrate the pre-telemetry flat per-alias file without losing it.
+            if "by_alias" not in data:
+                data = {"by_agent": {}, "by_alias": data, "by_model": {}, "by_device": {}}
+            _stats = {
+                key: value if isinstance(value, dict) else {}
+                for key, value in data.items()
+                if key in ("by_agent", "by_alias", "by_model", "by_device")
+            }
+            for key in ("by_agent", "by_alias", "by_model", "by_device"):
+                _stats.setdefault(key, {})
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -126,13 +139,14 @@ def _save_stats_if_due() -> None:
 
 def stats_snapshot() -> dict[str, Any]:
     with _stats_lock:
-        return {k: dict(v) for k, v in _stats.items()}
+        return {group: {key: dict(value) for key, value in values.items()} for group, values in _stats.items()}
 
 
 MAX_STATS_KEYS = 200
 
 
-def _update_stats(
+def _update_stats_bucket(
+    bucket: dict[str, dict[str, Any]],
     key: str,
     status: int | None,
     duration_ms: float | None,
@@ -140,31 +154,27 @@ def _update_stats(
     completion_tokens: int | None,
 ) -> None:
     is_error = status is None or status == 0 or status >= 400
-    with _stats_lock:
-        # Keys come from client-supplied model names — cap so a chatty or
-        # malicious client can't grow memory/disk without bound.
-        if key not in _stats and len(_stats) >= MAX_STATS_KEYS:
-            key = "(other)"
-        s = _stats.setdefault(
-            key,
-            {
-                "requests": 0,
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_duration_ms": 0.0,
-                "errors": 0,
-            },
-        )
-        s["requests"] += 1
-        if prompt_tokens:
-            s["prompt_tokens"] += prompt_tokens
-        if completion_tokens:
-            s["completion_tokens"] += completion_tokens
-        if duration_ms:
-            s["total_duration_ms"] += duration_ms
-        if is_error:
-            s["errors"] += 1
-    _save_stats_if_due()
+    if key not in bucket and len(bucket) >= MAX_STATS_KEYS:
+        key = "(other)"
+    s = bucket.setdefault(
+        key,
+        {
+            "requests": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_duration_ms": 0.0,
+            "errors": 0,
+        },
+    )
+    s["requests"] += 1
+    if prompt_tokens:
+        s["prompt_tokens"] += prompt_tokens
+    if completion_tokens:
+        s["completion_tokens"] += completion_tokens
+    if duration_ms:
+        s["total_duration_ms"] += duration_ms
+    if is_error:
+        s["errors"] += 1
 
 
 def record_request(
@@ -176,6 +186,8 @@ def record_request(
     duration_ms: float | None,
     prompt_tokens: int | None,
     completion_tokens: int | None,
+    client: str | None,
+    device: str | None,
 ) -> None:
     entry = {
         "ts": time.time(),
@@ -187,10 +199,17 @@ def record_request(
         "duration_ms": duration_ms,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
+        "agent": client,
+        "device": device,
     }
     with _requests_lock:
         _request_log.append(entry)
-    _update_stats(alias or model, status, duration_ms, prompt_tokens, completion_tokens)
+    with _stats_lock:
+        _update_stats_bucket(_stats["by_agent"], client or "unknown", status, duration_ms, prompt_tokens, completion_tokens)
+        _update_stats_bucket(_stats["by_alias"], alias or model, status, duration_ms, prompt_tokens, completion_tokens)
+        _update_stats_bucket(_stats["by_model"], model, status, duration_ms, prompt_tokens, completion_tokens)
+        _update_stats_bucket(_stats["by_device"], device or backend, status, duration_ms, prompt_tokens, completion_tokens)
+    _save_stats_if_due()
 
 
 def log(msg: str) -> None:
@@ -471,6 +490,7 @@ def _proxy_attempt(
     suffix: str,
     payload: dict[str, Any],
     requested_model: str,
+    client: str | None,
 ) -> tuple[int, bytes]:
     """One non-stream proxy attempt to a specific backend. Records activity + stats."""
     be = BACKENDS[bid]
@@ -500,7 +520,7 @@ def _proxy_attempt(
     record_request(
         alias or requested_model, bid, upstream, False,
         status if status else 502, duration_ms,
-        prompt_tokens, completion_tokens,
+        prompt_tokens, completion_tokens, client, str(be.get("device") or bid),
     )
     return status, resp
 
@@ -637,6 +657,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/models":
             data = {"object": "list", "data": merge_models()}
             self._send(200, json.dumps(data).encode())
+            return
+
+        if path == "/telemetry":
+            self._send(200, json.dumps({"telemetry": stats_snapshot()}).encode())
             return
 
         if path == "/requests":
@@ -813,6 +837,15 @@ class Handler(BaseHTTPRequestHandler):
         suffix = path[len("/v1") :]  # /chat/completions
 
         if stream:
+            # SGLang can report final streamed usage when asked. Keep this
+            # opt-in per backend so an older OpenAI-compatible server is never
+            # given an unsupported request field.
+            if be.get("stream_usage") and path == "/v1/chat/completions":
+                options = payload.get("stream_options")
+                if not isinstance(options, dict):
+                    options = {}
+                    payload["stream_options"] = options
+                options.setdefault("include_usage", True)
             payload["model"] = upstream
             body = json.dumps(payload).encode()
             target = base + suffix
@@ -822,10 +855,11 @@ class Handler(BaseHTTPRequestHandler):
             activity_begin(bid, upstream, alias or model)
             t0 = time.perf_counter()
             try:
-                self._proxy_stream(target, body)
+                status, prompt_tokens, completion_tokens = self._proxy_stream(target, body)
                 record_request(
                     alias or model, bid, upstream, True,
-                    None, (time.perf_counter() - t0) * 1000, None, None,
+                    status, (time.perf_counter() - t0) * 1000, prompt_tokens, completion_tokens,
+                    api_client, str(be.get("device") or bid),
                 )
             finally:
                 activity_end(bid)
@@ -836,7 +870,7 @@ class Handler(BaseHTTPRequestHandler):
         # remaining CHEAP_ORDER backend before giving up.
         alias_failover = bool((ALIASES.get(model) or {}).get("failover"))
         do_failover = failover_requested or model == "any" or alias_failover
-        status, resp = _proxy_attempt(bid, upstream, alias, suffix, payload, model)
+        status, resp = _proxy_attempt(bid, upstream, alias, suffix, payload, model, api_client)
 
         if do_failover and (status == 0 or status >= 500):
             tried = {bid}
@@ -851,7 +885,7 @@ class Handler(BaseHTTPRequestHandler):
                 log(f"failover: {bid} failed (status={status}) → trying {cand_bid}")
                 bid = cand_bid
                 upstream = chat_models[0]
-                status, resp = _proxy_attempt(bid, upstream, alias, suffix, payload, model)
+                status, resp = _proxy_attempt(bid, upstream, alias, suffix, payload, model, api_client)
                 if not (status == 0 or status >= 500):
                     break
 
@@ -860,13 +894,17 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(status if status else 502, resp)
 
-    def _proxy_stream(self, url: str, body: bytes) -> None:
+    def _proxy_stream(self, url: str, body: bytes) -> tuple[int | None, int | None, int | None]:
         req = urllib.request.Request(url, data=body, method="POST")
         req.add_header("Content-Type", "application/json")
         req.add_header("Accept", "text/event-stream")
         headers_sent = False
+        status: int | None = None
+        prompt_tokens = completion_tokens = None
+        remainder = ""
         try:
             with urllib.request.urlopen(req, timeout=300.0) as resp:
+                status = resp.status
                 self.send_response(resp.status)
                 ctype = resp.headers.get("Content-Type", "text/event-stream")
                 self.send_header("Content-Type", ctype)
@@ -881,10 +919,28 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
                     self.wfile.flush()
+                    # OpenAI SSE usage arrives in a final data event. Chunk
+                    # boundaries are arbitrary, so preserve a partial line.
+                    remainder += chunk.decode("utf-8", errors="ignore")
+                    lines = remainder.split("\n")
+                    remainder = lines.pop()
+                    for line in lines:
+                        if not line.startswith("data:"):
+                            continue
+                        raw = line.removeprefix("data:").strip()
+                        if not raw or raw == "[DONE]":
+                            continue
+                        try:
+                            usage = (json.loads(raw).get("usage") or {})
+                            prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+                            completion_tokens = usage.get("completion_tokens", completion_tokens)
+                        except Exception:
+                            pass
         except (BrokenPipeError, ConnectionResetError):
             # Client hung up mid-stream (closed the chat) — normal, not an error.
             log("stream client disconnected")
         except urllib.error.HTTPError as e:
+            status = e.code
             err = e.read()
             if not headers_sent:
                 self._send(e.code, err or json.dumps({"error": str(e)}).encode())
@@ -898,6 +954,7 @@ class Handler(BaseHTTPRequestHandler):
                     502,
                     json.dumps({"error": {"message": str(e), "type": "stream_error"}}).encode(),
                 )
+        return status, prompt_tokens, completion_tokens
 
 
 def main() -> None:

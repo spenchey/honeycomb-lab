@@ -237,6 +237,23 @@
   .trow .t-status.err { color: var(--red); }
   #trafficEmpty { padding: 14px 16px; color: var(--muted); font-size: 11px; }
 
+  /* ---------- Accounted telemetry ---------- */
+  #telemetry {
+    flex: 0 0 auto;
+    border-top: 1px solid var(--stroke);
+    background: var(--panel);
+  }
+  #telemetryHead {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 16px; min-height: 38px;
+    font-size: 10px; letter-spacing: 1.5px; color: var(--muted);
+  }
+  #telemetryList { display: flex; gap: 14px; overflow-x: auto; padding: 0 16px 9px; }
+  .telemetry-group { min-width: 175px; font-size: 10px; }
+  .telemetry-title { color: var(--green-dim); margin-bottom: 3px; letter-spacing: 1px; }
+  .telemetry-row { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; color: var(--text); }
+  .telemetry-row span:last-child { color: var(--muted); white-space: nowrap; }
+
   ::-webkit-scrollbar { width: 8px; height: 8px; }
   ::-webkit-scrollbar-thumb { background: var(--stroke); border-radius: 4px; }
   ::-webkit-scrollbar-track { background: transparent; }
@@ -283,6 +300,11 @@
     </div>
     <div id="inspBody"></div>
   </div>
+</div>
+
+<div id="telemetry">
+  <div id="telemetryHead"><span>ACCOUNTED USAGE</span><span id="telemetryCount">REPORTED TOKENS ONLY</span></div>
+  <div id="telemetryList"></div>
 </div>
 
 <div id="traffic">
@@ -344,6 +366,7 @@
   var trafficHead = document.getElementById("trafficHead");
   var trafficList = document.getElementById("trafficList");
   var trafficCount = document.getElementById("trafficCount");
+  var telemetryList = document.getElementById("telemetryList");
 
   // ---------- Hex geometry helpers ----------
   function axialToPixel(q, r, s) {
@@ -1005,6 +1028,7 @@
       var mb = document.createElement("div");
       mb.className = "metric-block";
       if (m.gpuUtilPct != null) mb.appendChild(buildBar("GPU", m.gpuUtilPct));
+      if (m.cpuUtilPct != null) mb.appendChild(buildBar("CPU", m.cpuUtilPct));
       if (m.memUsedMB != null && m.memTotalMB != null) {
         var usedGB = (m.memUsedMB / 1024).toFixed(1);
         var totGB = (m.memTotalMB / 1024).toFixed(1);
@@ -1145,7 +1169,7 @@
 
       var alias = document.createElement("span");
       alias.className = "t-alias";
-      alias.textContent = r.alias || "—";
+      alias.textContent = (r.agent ? r.agent + " · " : "") + (r.alias || "—");
 
       var model = document.createElement("span");
       model.className = "t-model";
@@ -1176,6 +1200,41 @@
     });
   }
 
+  function renderTelemetry(telemetry) {
+    telemetryList.innerHTML = "";
+    var groups = [
+      ["AGENTS", telemetry && telemetry.by_agent],
+      ["MODELS", telemetry && telemetry.by_model],
+      ["DEVICES", telemetry && telemetry.by_device]
+    ];
+    groups.forEach(function (pair) {
+      var box = document.createElement("div");
+      box.className = "telemetry-group";
+      var title = document.createElement("div");
+      title.className = "telemetry-title";
+      title.textContent = pair[0];
+      box.appendChild(title);
+      var rows = Object.keys(pair[1] || {}).sort(function (a, b) {
+        return ((pair[1][b].prompt_tokens || 0) + (pair[1][b].completion_tokens || 0)) - ((pair[1][a].prompt_tokens || 0) + (pair[1][a].completion_tokens || 0));
+      });
+      if (!rows.length) {
+        var empty = document.createElement("div");
+        empty.className = "telemetry-row";
+        empty.textContent = "No gateway calls yet";
+        box.appendChild(empty);
+      }
+      rows.slice(0, 4).forEach(function (key) {
+        var rec = pair[1][key];
+        var row = document.createElement("div");
+        row.className = "telemetry-row";
+        var total = (rec.prompt_tokens || 0) + (rec.completion_tokens || 0);
+        row.innerHTML = "<span>" + truncEnd(key, 20) + "</span><span>" + total + " tok · " + (rec.requests || 0) + " req</span>";
+        box.appendChild(row);
+      });
+      telemetryList.appendChild(box);
+    });
+  }
+
   trafficHead.addEventListener("click", function () {
     trafficEl.classList.toggle("collapsed");
   });
@@ -1194,6 +1253,10 @@
       fetch("/requests", { cache: "no-store" }).then(function (r) {
         if (!r.ok) throw new Error("requests " + r.status);
         return r.json();
+      }),
+      fetch("/telemetry", { cache: "no-store" }).then(function (r) {
+        if (!r.ok) throw new Error("telemetry " + r.status);
+        return r.json();
       })
     ]).then(function (results) {
       state.gatewayUp = true;
@@ -1204,6 +1267,7 @@
       mapWrap.classList.remove("down");
       renderMap(state.nodesData);
       renderTraffic(state.requestsData);
+      renderTelemetry((results[2] && results[2].telemetry) || {});
 
       if (state.inspectorOpen && state.selectedId) {
         var node = findNodeById(state.selectedId);
