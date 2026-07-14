@@ -274,6 +274,22 @@ def _probe_one(node: dict[str, Any]) -> None:
             "metrics": None,
             "pathBadge": "?",
         }
+    # Pair mode is managed from the Mac mini scheduler, not from either GPU.
+    # A dedicated read-only command keeps the dashboard honest without
+    # inferring mode from an individual container.
+    if node.get("modeStatusCommand") and node.get("modeHost"):
+        code, out = _run(
+            ["ssh", *SSH_OPTS, "--", node["modeHost"], node["modeStatusCommand"]], timeout=20
+        )
+        try:
+            mode = json.loads(out)
+            if not isinstance(mode, dict):
+                raise ValueError("mode status was not an object")
+            result["mode"] = mode
+            label = str(mode.get("mode") or "unknown").upper()
+            result["detail"] = result.get("detail", "") + f" · mode {label}"
+        except Exception:
+            result["mode"] = {"mode": "unknown", "error": f"status command failed (exit {code})"}
     import collections
 
     now = time.time()
@@ -375,6 +391,7 @@ def snapshot(activity: dict[str, Any]) -> dict[str, Any]:
                 "canPing": bool(n.get("pingAlias")),
                 "canDoctor": bool(n.get("doctorCommand") and n.get("sshHost")),
                 "canControl": bool(n.get("container") and n.get("sshHost")),
+                "canModeControl": bool(n.get("modeCommands") and n.get("modeHost")),
                 **st,
             }
         )
@@ -393,7 +410,7 @@ def _find_node(node_id: str) -> dict[str, Any] | None:
     return None
 
 
-def action_ping(node_id: str, gateway_port: int) -> dict[str, Any]:
+def action_ping(node_id: str, gateway_base_url: str, api_token: str) -> dict[str, Any]:
     """One-shot prompt through the gateway using the node's alias."""
     import urllib.request
 
@@ -409,9 +426,9 @@ def action_ping(node_id: str, gateway_port: int) -> dict[str, Any]:
         }
     ).encode()
     req = urllib.request.Request(
-        f"http://127.0.0.1:{gateway_port}/v1/chat/completions",
+        gateway_base_url.rstrip("/") + "/v1/chat/completions",
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_token}"},
         method="POST",
     )
     t0 = time.perf_counter()
@@ -478,3 +495,19 @@ def action_container(node_id: str, verb: str) -> dict[str, Any]:
         )
         return {"ok": True, "message": msg}
     return {"ok": False, "error": f"{verb} failed (exit {code}) {out.strip()[:120]}"}
+
+
+def action_mode(node_id: str, mode: str) -> dict[str, Any]:
+    """Switch a configured pair mode. Commands come only from fleet.json."""
+    node = _find_node(node_id)
+    commands = node.get("modeCommands") if node else None
+    host = node.get("modeHost") if node else None
+    if not node or not isinstance(commands, dict) or not host:
+        return {"ok": False, "error": "node has no mode controls"}
+    command = commands.get(mode)
+    if not isinstance(command, str) or not command:
+        return {"ok": False, "error": "unsupported mode"}
+    code, out = _run(["ssh", *SSH_OPTS, "--", host, command], timeout=1500)
+    if code != 0:
+        return {"ok": False, "error": f"{mode} mode failed (exit {code}) {out.strip()[-240:]}"}
+    return {"ok": True, "message": f"{mode} mode command completed", "detail": out.strip()[-240:]}

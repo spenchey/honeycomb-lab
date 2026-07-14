@@ -169,6 +169,9 @@ Full feature parity: map, LIT pulses, inspector with metrics + latency
 trend, traffic feed, and PING/DOCTOR/SERVE/STOP.
 
 **Security model:**
+- Model requests require an `Authorization: Bearer <agent-token>` header when
+  `api_tokens` is configured. Give each agent a different token. An inference
+  token can route requests but cannot operate a machine.
 - Control actions (`/control/*`) require the `X-Honeycomb-Token` header
   from anywhere but localhost. Set `control_token` in `config.json`
   (`openssl rand -hex 16`); the dashboard prompts once and remembers it.

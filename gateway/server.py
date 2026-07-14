@@ -686,6 +686,25 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return self._token_valid()
 
+    def _api_client(self) -> str | None:
+        """Return the named API client for a valid inference token.
+
+        Model calls are deliberately separate from dashboard controls: an
+        agent gets only an inference credential, never the control-plane
+        credential that can start or stop a Spark container.
+        """
+        auth = self.headers.get("Authorization") or ""
+        supplied = auth.removeprefix("Bearer ").strip()
+        if not supplied:
+            supplied = (self.headers.get("X-Honeycomb-API-Token") or "").strip()
+        tokens = CFG.get("api_tokens") or {}
+        if not supplied or not isinstance(tokens, dict):
+            return None
+        for client, token in tokens.items():
+            if isinstance(token, str) and token and hmac.compare_digest(supplied, token):
+                return str(client)
+        return None
+
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path.rstrip("/") or "/"
 
@@ -702,11 +721,19 @@ class Handler(BaseHTTPRequestHandler):
             node_id = str(body.get("node") or "")
             action = path.removeprefix("/control/")
             if action == "ping":
-                result = fleet_nodes.action_ping(node_id, int(CFG.get("listen_port", 4000)))
+                host = CFG.get("listen_host", "127.0.0.1")
+                port = int(CFG.get("listen_port", 4000))
+                result = fleet_nodes.action_ping(
+                    node_id,
+                    f"http://{host}:{port}",
+                    str(CFG.get("internal_api_token") or ""),
+                )
             elif action == "doctor":
                 result = fleet_nodes.action_doctor(node_id)
             elif action == "container":
                 result = fleet_nodes.action_container(node_id, str(body.get("verb") or ""))
+            elif action == "mode":
+                result = fleet_nodes.action_mode(node_id, str(body.get("mode") or ""))
             else:
                 self._send(404, json.dumps({"error": {"message": f"unknown action {action}"}}).encode(), cors=False)
                 return
@@ -720,6 +747,11 @@ class Handler(BaseHTTPRequestHandler):
             "/v1/embeddings",
         ):
             self._send(404, json.dumps({"error": {"message": f"not found: {path}"}}).encode())
+            return
+
+        api_client = self._api_client()
+        if api_client is None:
+            self._send(401, json.dumps({"error": {"message": "Honeycomb API token required"}}).encode())
             return
 
         raw = self._read_body()
@@ -802,7 +834,8 @@ class Handler(BaseHTTPRequestHandler):
         # Non-stream: proxy, and on upstream failure with failover enabled
         # (explicit "failover": true, or the "any" alias) retry once per
         # remaining CHEAP_ORDER backend before giving up.
-        do_failover = failover_requested or model == "any"
+        alias_failover = bool((ALIASES.get(model) or {}).get("failover"))
+        do_failover = failover_requested or model == "any" or alias_failover
         status, resp = _proxy_attempt(bid, upstream, alias, suffix, payload, model)
 
         if do_failover and (status == 0 or status >= 500):

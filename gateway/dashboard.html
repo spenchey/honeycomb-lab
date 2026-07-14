@@ -852,8 +852,8 @@
     return btn;
   }
 
-  // ---------- Node control actions (ping / doctor / serve / stop) ----------
-  var actionState = {}; // node id -> {pingBusy,pingResult,doctorBusy,doctorResult,ctrlBusy,ctrlResult}
+  // ---------- Node control actions (ping / doctor / serve / stop / pair mode) ----------
+  var actionState = {}; // node id -> transient action state
   function getActionState(id) {
     if (!actionState[id]) actionState[id] = {};
     return actionState[id];
@@ -916,6 +916,23 @@
     });
   }
 
+  function doMode(id, mode, nodeName) {
+    if (!confirm("Switch " + (nodeName || id) + " to " + mode.toUpperCase() + " mode? This changes the paired Sparks and may take several minutes.")) return;
+    var as = getActionState(id);
+    if (as.modeBusy) return;
+    as.modeBusy = true;
+    refreshInspectorIfOpen(id);
+    postControl("/control/mode", { node: id, mode: mode }).then(function (res) {
+      as.modeBusy = false;
+      as.modeResult = res.data || { ok: false, error: "no response" };
+      refreshInspectorIfOpen(id);
+    }).catch(function () {
+      as.modeBusy = false;
+      as.modeResult = { ok: false, error: "network error" };
+      refreshInspectorIfOpen(id);
+    });
+  }
+
   function buildButtonRow(node) {
     var as = getActionState(node.id);
     var row = document.createElement("div");
@@ -932,6 +949,10 @@
     }
     if (node.canControl && node.inferenceOK) {
       row.appendChild(chipButton(as.ctrlBusy ? "STOP…" : "STOP", as.ctrlBusy, function () { doContainer(node.id, "stop", node.name); }, "red"));
+    }
+    if (node.canModeControl) {
+      row.appendChild(chipButton(as.modeBusy ? "SWITCHING…" : "DAY: DEEPSEEK", as.modeBusy, function () { doMode(node.id, "day", node.name); }, "green"));
+      row.appendChild(chipButton(as.modeBusy ? "SWITCHING…" : "NIGHT: MEDIA", as.modeBusy, function () { doMode(node.id, "media", node.name); }, "red"));
     }
     return row;
   }
@@ -960,6 +981,9 @@
     addRow("PATH", node.pathBadge || "—");
     addRow("DETAIL", node.detail || "—");
     addRow("LATENCY", node.latencyMs != null ? Math.round(node.latencyMs) + " ms" : "—");
+    if (node.mode) {
+      addRow("PAIR MODE", String(node.mode.mode || "unknown").toUpperCase(), node.mode.mode === "deepseek" ? "online" : (node.mode.mode === "media" ? "degraded" : "unknown"));
+    }
 
     if (node.latencySeries && node.latencySeries.length > 4 && node.latencySeries.some(function (v) { return v > 0; })) {
       var trendRow = document.createElement("div");
@@ -1017,7 +1041,7 @@
 
     // ---- Control buttons ----
     var as = getActionState(node.id);
-    if (node.canPing || node.canDoctor || node.canControl) {
+    if (node.canPing || node.canDoctor || node.canControl || node.canModeControl) {
       inspBody.appendChild(buildButtonRow(node));
     }
 
@@ -1045,6 +1069,14 @@
       cline.className = "result-line" + (cr.ok === false ? " err" : "");
       cline.textContent = "CTRL " + (cr.ok === false ? (cr.error || "failed") : (cr.message || "ok"));
       inspBody.appendChild(cline);
+    }
+
+    if (as.modeResult) {
+      var mr = as.modeResult;
+      var mline = document.createElement("div");
+      mline.className = "result-line" + (mr.ok === false ? " err" : "");
+      mline.textContent = "MODE " + (mr.ok === false ? (mr.error || "failed") : (mr.message || "ok"));
+      inspBody.appendChild(mline);
     }
 
     // ---- DOCTOR report (from a manual run, or the latest auto-run surfaced via /nodes) ----

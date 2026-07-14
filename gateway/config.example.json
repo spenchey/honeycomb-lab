@@ -7,6 +7,11 @@
     "spark1"
   ],
   "control_token": "__REPLACE_ME__",
+  "api_tokens": {
+    "dev": "__REPLACE_WITH_A_UNIQUE_AGENT_TOKEN__",
+    "honeycomb-dashboard": "__REPLACE_WITH_A_PRIVATE_INTERNAL_TOKEN__"
+  },
+  "internal_api_token": "__SAME_VALUE_AS_honeycomb-dashboard__",
   "backends": {
     "spark1": {
       "name": "Spark One (vLLM)",
@@ -23,6 +28,11 @@
     "spark-main": {
       "backend": "spark1",
       "upstream_model": null
+    },
+    "dev-local": {
+      "backend": "spark1",
+      "upstream_model": null,
+      "failover": true
     },
     "local-lms": {
       "backend": "lms",
