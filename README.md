@@ -170,6 +170,10 @@ makes daily reporting, error-rate review, and capacity decisions reproducible.
 `/alerts` reports unavailable, slow, or repeatedly failing backends. Set
 `alert_webhook` to an `env:VARIABLE_NAME` reference to deliver those alerts to
 a Slack-compatible incoming webhook; alerts are de-duplicated by cooldown.
+Alternatively, `alert_command` may be an explicit argv list for a protected
+local sender such as `Scripts/send-honeycomb-alert.py`; its generated alert
+message is appended as the final argument. Honeycomb never accepts alert
+commands from a browser or agent request.
 
 #### Authenticated cloud providers
 

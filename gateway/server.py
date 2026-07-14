@@ -18,6 +18,7 @@ import ipaddress
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -357,10 +358,23 @@ def _dispatch_alert(alert: dict[str, Any]) -> None:
     Absence of the webhook is intentional: the alert remains visible at
     /alerts instead of silently attempting network delivery.
     """
+    message = f"Honeycomb {alert['severity']}: {alert['message']}"
+    # A local command is useful when the existing Slack bot credential lives
+    # in a protected Hermes profile rather than an incoming-webhook variable.
+    # It is an operator-configured argv list, never supplied by a request.
+    command = CFG.get("alert_command")
+    if isinstance(command, list) and command and all(isinstance(part, str) and part for part in command):
+        try:
+            result = subprocess.run(command + [message], capture_output=True, text=True, timeout=15, check=False)
+            if result.returncode != 0:
+                log(f"alert command failed ({result.returncode}): {result.stderr.strip()[:200]}")
+        except Exception as e:
+            log(f"alert command failed: {e}")
+        return
     webhook = _safe_env_header(str(CFG.get("alert_webhook") or ""))
     if not webhook:
         return
-    payload = json.dumps({"text": f"Honeycomb {alert['severity']}: {alert['message']}"}).encode()
+    payload = json.dumps({"text": message}).encode()
     try:
         http_json("POST", webhook, body=payload, timeout=5.0)
     except Exception as e:

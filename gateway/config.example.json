@@ -15,6 +15,12 @@
   "telemetry_events_path": "~/Library/Application Support/Honeycomb/telemetry-events.jsonl",
   "audit_log_path": "~/Library/Application Support/Honeycomb/control-audit.jsonl",
   "alert_webhook": "env:HONEYCOMB_ALERT_WEBHOOK",
+  "alert_command": [
+    "/usr/bin/python3",
+    "/absolute/path/to/send-honeycomb-alert.py",
+    "--channel",
+    "C0123ABCDE"
+  ],
   "alert_cooldown_sec": 900,
   "alert_error_window_sec": 900,
   "alert_error_threshold": 3,
