@@ -94,7 +94,11 @@ STATS_PATH = ROOT / "stats.json"
 STATS_WRITE_INTERVAL_SEC = 30.0
 _stats_lock = threading.Lock()
 _stats: dict[str, dict[str, dict[str, Any]]] = {
-    "by_agent": {}, "by_alias": {}, "by_model": {}, "by_device": {}
+    "by_agent": {},
+    "by_alias": {},
+    "by_model": {},
+    "by_device": {},
+    "by_agent_model_device": {},
 }
 _stats_last_write = 0.0
 
@@ -107,13 +111,19 @@ def _load_stats() -> None:
         if isinstance(data, dict):
             # Migrate the pre-telemetry flat per-alias file without losing it.
             if "by_alias" not in data:
-                data = {"by_agent": {}, "by_alias": data, "by_model": {}, "by_device": {}}
+                data = {
+                    "by_agent": {},
+                    "by_alias": data,
+                    "by_model": {},
+                    "by_device": {},
+                    "by_agent_model_device": {},
+                }
             _stats = {
                 key: value if isinstance(value, dict) else {}
                 for key, value in data.items()
-                if key in ("by_agent", "by_alias", "by_model", "by_device")
+                if key in ("by_agent", "by_alias", "by_model", "by_device", "by_agent_model_device")
             }
-            for key in ("by_agent", "by_alias", "by_model", "by_device"):
+            for key in ("by_agent", "by_alias", "by_model", "by_device", "by_agent_model_device"):
                 _stats.setdefault(key, {})
     except FileNotFoundError:
         pass
@@ -209,6 +219,15 @@ def record_request(
         _update_stats_bucket(_stats["by_alias"], alias or model, status, duration_ms, prompt_tokens, completion_tokens)
         _update_stats_bucket(_stats["by_model"], model, status, duration_ms, prompt_tokens, completion_tokens)
         _update_stats_bucket(_stats["by_device"], device or backend, status, duration_ms, prompt_tokens, completion_tokens)
+        route_key = " | ".join((client or "unknown", model, device or backend))
+        _update_stats_bucket(
+            _stats["by_agent_model_device"],
+            route_key,
+            status,
+            duration_ms,
+            prompt_tokens,
+            completion_tokens,
+        )
     _save_stats_if_due()
 
 

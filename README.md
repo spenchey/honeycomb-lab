@@ -139,18 +139,19 @@ model (embedding models are skipped).
 
 Endpoints: `/v1/chat/completions` · `/v1/completions` · `/v1/embeddings`
 (all proxied, stream + non-stream) · `/health` (backends, activity,
-telemetry) · `/telemetry` (accounted usage by agent, alias, model, and
-device) · `/nodes` (fleet status for the dashboard) · `/requests` (recent
+telemetry) · `/telemetry` (accounted usage by agent, model, device, and the
+combined agent/model/device route) · `/nodes` (fleet status for the dashboard) · `/requests` (recent
 traffic) · `/control/*` (ping / doctor / container / configured pair mode —
 see security below).
 
 ### Telemetry
 
 Honeycomb records each routed request by the authenticated agent token, route
-alias, resolved model, and configured device. Token totals are counted only
-when the upstream model returns a `usage` object; streamed usage can be
-enabled per backend with `"stream_usage": true`. The dashboard's **ACCOUNTED
-USAGE** strip shows the same data without estimating missing tokens. Spark
+alias, resolved model, configured device, and the combined agent/model/device
+route. Token totals are counted only when the upstream model returns a `usage`
+object; streamed usage can be enabled per backend with `"stream_usage": true`.
+The dashboard's **ACCOUNTED USAGE** strip shows the same data without estimating
+missing tokens. Spark
 nodes show GPU, memory, and CPU through SSH; an HTTP-only endpoint can also
 provide CPU by adding `sshHost` and `metricsCommand` to its fleet entry.
 

@@ -1203,6 +1203,7 @@
   function renderTelemetry(telemetry) {
     telemetryList.innerHTML = "";
     var groups = [
+      ["AGENT / MODEL / DEVICE", telemetry && telemetry.by_agent_model_device],
       ["AGENTS", telemetry && telemetry.by_agent],
       ["MODELS", telemetry && telemetry.by_model],
       ["DEVICES", telemetry && telemetry.by_device]
