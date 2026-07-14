@@ -161,6 +161,47 @@ specific model/device and can have an explicit fallback. Changing a physically
 loaded model is intentionally a separate configured operation, because it
 stops and reloads the serving process.
 
+#### Operational history and alerts
+
+`/telemetry` is the live cumulative view. The gateway also writes a
+metadata-only JSONL ledger (no prompts, completions, or credentials) and
+serves time-window data at `/telemetry/history?since=<unix-seconds>`. This
+makes daily reporting, error-rate review, and capacity decisions reproducible.
+`/alerts` reports unavailable, slow, or repeatedly failing backends. Set
+`alert_webhook` to an `env:VARIABLE_NAME` reference to deliver those alerts to
+a Slack-compatible incoming webhook; alerts are de-duplicated by cooldown.
+
+#### Authenticated cloud providers
+
+Honeycomb can proxy any provider that exposes a compatible OpenAI API, but
+provider credentials are never placed in agent configuration, dashboard code,
+or committed JSON. Add a backend with a header reference such as:
+
+```json
+"headers": { "Authorization": "env:HONEYCOMB_PROVIDER_API_KEY" }
+```
+
+Then put that environment variable only in the gateway service environment.
+Honeycomb uses it for health checks and proxied requests, while each agent
+still authenticates to Honeycomb with its own inference token. First test a
+dedicated non-production alias; do not move a working production cloud agent
+until its smoke test and usage accounting are confirmed.
+
+#### Safe model profiles and audit trail
+
+The gateway never accepts a shell command from the browser. A fleet node may
+declare named `modelProfiles`, each with an `activateCommand`, optional
+`verifyCommand`, and optional `rollbackCommand`. `POST /control/profile`
+requires a control token and an exact profile-name confirmation. Every control
+action is appended to the protected `/audit` trail. This keeps a physical model
+swap explicit, testable, and recoverable instead of mixing it into model alias
+routing.
+
+`links` may be topology-only `["node-a", "node-b"]` or declare a configured
+SSH `checkHost` and `checkCommand`. Honeycomb labels topology-only links
+**unverified** rather than claiming a cabled Spark fabric is healthy without a
+real link probe.
+
 ## fleet.json
 
 Nodes are described in `~/Library/Application Support/Honeycomb/fleet.json`

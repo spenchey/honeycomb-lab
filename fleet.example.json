@@ -14,6 +14,15 @@
       "gatewayBackend": "spark1",
       "pingAlias": "spark-main",
       "container": "my-vllm-container",
+      "modelProfiles": {
+        "coding": {
+          "activateCommand": "/opt/honeycomb/serve-coding-model.sh",
+          "verifyCommand": "curl -fsS http://127.0.0.1:8000/v1/models >/dev/null",
+          "rollbackCommand": "/opt/honeycomb/restore-previous-model.sh",
+          "autoRollback": true,
+          "timeoutSec": 1200
+        }
+      },
       "notes": "Online = SSH reachable. Models = whatever vLLM serves."
     },
     {
@@ -29,5 +38,12 @@
       "notes": "The machine Honeycomb runs on."
     }
   ],
-  "links": []
+  "links": [
+    {
+      "from": "spark1",
+      "to": "hub",
+      "checkHost": "spark1",
+      "checkCommand": "test -r /sys/class/net/eth0/operstate && test \"$(cat /sys/class/net/eth0/operstate)\" = up"
+    }
+  ]
 }

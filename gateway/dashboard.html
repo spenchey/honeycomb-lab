@@ -243,6 +243,10 @@
     border-top: 1px solid var(--stroke);
     background: var(--panel);
   }
+  #alerts { border-top: 1px solid var(--stroke); padding: 8px 16px; display: none; gap: 8px; flex-wrap: wrap; }
+  #alerts.visible { display: flex; }
+  .alert { font-size: 10px; padding: 5px 7px; border: 1px solid #7d4e13; color: #ffd18b; background: rgba(125,78,19,.14); }
+  .alert.high { border-color: #8f2638; color: #ff9bad; background: rgba(143,38,56,.14); }
   #telemetryHead {
     display: flex; align-items: center; justify-content: space-between;
     padding: 8px 16px; min-height: 38px;
@@ -306,6 +310,7 @@
   <div id="telemetryHead"><span>ACCOUNTED USAGE</span><span id="telemetryCount">REPORTED TOKENS ONLY</span></div>
   <div id="telemetryList"></div>
 </div>
+<div id="alerts"></div>
 
 <div id="traffic">
   <div id="trafficHead">
@@ -367,6 +372,7 @@
   var trafficList = document.getElementById("trafficList");
   var trafficCount = document.getElementById("trafficCount");
   var telemetryList = document.getElementById("telemetryList");
+  var alertsEl = document.getElementById("alerts");
 
   // ---------- Hex geometry helpers ----------
   function axialToPixel(q, r, s) {
@@ -1236,6 +1242,17 @@
     });
   }
 
+  function renderAlerts(alerts) {
+    alertsEl.innerHTML = "";
+    alertsEl.classList.toggle("visible", !!(alerts && alerts.length));
+    (alerts || []).forEach(function (alert) {
+      var item = document.createElement("div");
+      item.className = "alert " + (alert.severity || "medium");
+      item.textContent = (alert.severity || "notice").toUpperCase() + ": " + (alert.message || "Unknown alert");
+      alertsEl.appendChild(item);
+    });
+  }
+
   trafficHead.addEventListener("click", function () {
     trafficEl.classList.toggle("collapsed");
   });
@@ -1258,6 +1275,10 @@
       fetch("/telemetry", { cache: "no-store" }).then(function (r) {
         if (!r.ok) throw new Error("telemetry " + r.status);
         return r.json();
+      }),
+      fetch("/alerts", { cache: "no-store" }).then(function (r) {
+        if (!r.ok) throw new Error("alerts " + r.status);
+        return r.json();
       })
     ]).then(function (results) {
       state.gatewayUp = true;
@@ -1269,6 +1290,7 @@
       renderMap(state.nodesData);
       renderTraffic(state.requestsData);
       renderTelemetry((results[2] && results[2].telemetry) || {});
+      renderAlerts((results[3] && results[3].alerts) || []);
 
       if (state.inspectorOpen && state.selectedId) {
         var node = findNodeById(state.selectedId);

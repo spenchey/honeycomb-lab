@@ -22,6 +22,8 @@ class TelemetryTests(unittest.TestCase):
         sys.modules.pop("server", None)
         self.server = importlib.import_module("server")
         self.server.STATS_PATH = Path(self.tempdir.name) / "stats.json"
+        self.server.EVENTS_PATH = Path(self.tempdir.name) / "events.jsonl"
+        self.server.AUDIT_PATH = Path(self.tempdir.name) / "audit.jsonl"
         self.server._stats_last_write = time.time()
         self.server._stats = {
             "by_agent": {},

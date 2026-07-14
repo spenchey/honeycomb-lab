@@ -402,10 +402,38 @@ def snapshot(activity: dict[str, Any]) -> dict[str, Any]:
                 "canDoctor": bool(n.get("doctorCommand") and n.get("sshHost")),
                 "canControl": bool(n.get("container") and n.get("sshHost")),
                 "canModeControl": bool(n.get("modeCommands") and n.get("modeHost")),
+                "canProfileControl": bool(n.get("modelProfiles") and (n.get("profileHost") or n.get("sshHost"))),
+                "modelProfiles": sorted((n.get("modelProfiles") or {}).keys()),
+                "gatewayBackend": n.get("gatewayBackend"),
+                "gatewayAliases": list(n.get("litAliases") or []),
                 **st,
             }
         )
-    return {"title": fleet["title"], "links": fleet["links"], "nodes": nodes_out}
+    return {"title": fleet["title"], "links": _link_snapshot(fleet.get("links") or []), "nodes": nodes_out}
+
+
+def _link_snapshot(links: list[Any]) -> list[dict[str, Any]]:
+    """Return link state without declaring a physical fabric healthy by name.
+
+    A legacy [from, to] link is topology-only until a safe explicit probe is
+    configured. Object links may define checkHost/checkCommand; only that
+    declared command is executed over SSH.
+    """
+    output: list[dict[str, Any]] = []
+    for raw in links:
+        if isinstance(raw, list) and len(raw) == 2:
+            output.append({"from": raw[0], "to": raw[1], "health": "unverified", "detail": "topology only"})
+            continue
+        if not isinstance(raw, dict):
+            continue
+        entry = {"from": raw.get("from"), "to": raw.get("to"), "health": "unverified", "detail": "no link probe configured"}
+        host, command = raw.get("checkHost"), raw.get("checkCommand")
+        if isinstance(host, str) and isinstance(command, str) and host and command:
+            code, out = _run(["ssh", *SSH_OPTS, "--", host, command], timeout=10)
+            entry["health"] = "online" if code == 0 else "offline"
+            entry["detail"] = out.strip()[-160:] or ("link check passed" if code == 0 else f"link check failed ({code})")
+        output.append(entry)
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -521,3 +549,49 @@ def action_mode(node_id: str, mode: str) -> dict[str, Any]:
     if code != 0:
         return {"ok": False, "error": f"{mode} mode failed (exit {code}) {out.strip()[-240:]}"}
     return {"ok": True, "message": f"{mode} mode command completed", "detail": out.strip()[-240:]}
+
+
+def action_profile(node_id: str, profile_name: str) -> dict[str, Any]:
+    """Activate one explicitly configured model profile.
+
+    Profile commands are declared in fleet.json rather than supplied by the
+    browser. This prevents the dashboard from becoming arbitrary SSH access.
+    A profile can declare a rollback command for the operator to invoke after
+    a failed load; automatic rollback is intentionally only enabled when the
+    profile explicitly asks for it.
+    """
+    node = _find_node(node_id)
+    profiles = node.get("modelProfiles") if node else None
+    host = (node.get("profileHost") or node.get("sshHost")) if node else None
+    if not node or not isinstance(profiles, dict) or not isinstance(host, str):
+        return {"ok": False, "error": "node has no configured model profiles"}
+    profile = profiles.get(profile_name)
+    if not isinstance(profile, dict):
+        return {"ok": False, "error": "unknown model profile"}
+    command = profile.get("activateCommand")
+    if not isinstance(command, str) or not command:
+        return {"ok": False, "error": "profile has no activation command"}
+    timeout = min(max(int(profile.get("timeoutSec") or 900), 10), 1800)
+    code, out = _run(["ssh", *SSH_OPTS, "--", host, command], timeout=timeout)
+    if code != 0:
+        rollback = profile.get("rollbackCommand")
+        rolled_back = False
+        if profile.get("autoRollback") is True and isinstance(rollback, str) and rollback:
+            rb_code, _ = _run(["ssh", *SSH_OPTS, "--", host, rollback], timeout=timeout)
+            rolled_back = rb_code == 0
+        return {"ok": False, "error": f"profile activation failed (exit {code}) {out.strip()[-240:]}", "rolledBack": rolled_back}
+    verify = profile.get("verifyCommand")
+    if isinstance(verify, str) and verify:
+        verify_code, verify_out = _run(["ssh", *SSH_OPTS, "--", host, verify], timeout=min(timeout, 180))
+        if verify_code != 0:
+            rollback = profile.get("rollbackCommand")
+            rolled_back = False
+            if profile.get("autoRollback") is True and isinstance(rollback, str) and rollback:
+                rb_code, _ = _run(["ssh", *SSH_OPTS, "--", host, rollback], timeout=timeout)
+                rolled_back = rb_code == 0
+            return {
+                "ok": False,
+                "error": f"profile activated but smoke test failed (exit {verify_code}) {verify_out.strip()[-240:]}",
+                "rolledBack": rolled_back,
+            }
+    return {"ok": True, "message": f"profile {profile_name} activation completed", "detail": out.strip()[-240:]}
