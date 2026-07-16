@@ -114,6 +114,8 @@ _alert_state: dict[str, float] = {}
 ALERT_COOLDOWN_SEC = int(CFG.get("alert_cooldown_sec") or 900)
 ALERT_ERROR_WINDOW_SEC = int(CFG.get("alert_error_window_sec") or 900)
 ALERT_ERROR_THRESHOLD = int(CFG.get("alert_error_threshold") or 3)
+ALERT_BACKEND_FAILURE_THRESHOLD = max(1, int(CFG.get("alert_backend_failure_threshold") or 3))
+ALERT_BACKEND_FAILURE_GRACE_SEC = max(0, int(CFG.get("alert_backend_failure_grace_sec") or 30))
 
 
 def _load_stats() -> None:
@@ -386,10 +388,14 @@ def evaluate_alerts() -> list[dict[str, Any]]:
     now = time.time()
     alerts: list[dict[str, Any]] = []
     for backend_id, (healthy, _, latency) in all_backend_status().items():
-        if not healthy:
+        if not healthy and _backend_probe_alert_ready(backend_id, now):
             alerts.append({
                 "id": f"backend-down:{backend_id}", "severity": "high",
-                "message": f"{backend_id} is not answering its model health check", "backend": backend_id,
+                "message": (
+                    f"{backend_id} failed {ALERT_BACKEND_FAILURE_THRESHOLD} consecutive model health checks "
+                    f"over at least {ALERT_BACKEND_FAILURE_GRACE_SEC} seconds"
+                ),
+                "backend": backend_id,
             })
         elif latency is not None and latency > float(CFG.get("alert_latency_ms") or 5000):
             alerts.append({
@@ -413,6 +419,8 @@ def evaluate_alerts() -> list[dict[str, Any]]:
             last = _alert_state.get(alert["id"], 0.0)
             if now - last >= ALERT_COOLDOWN_SEC:
                 _alert_state[alert["id"]] = now
+                if alert["id"].startswith("backend-down:"):
+                    _mark_backend_alerted(alert["backend"])
                 _dispatch_alert(alert)
     return alerts
 
@@ -517,6 +525,7 @@ def backend_healthy(backend: dict[str, Any]) -> tuple[bool, list[str], float | N
 # for a couple of seconds.
 _probe_lock = threading.Lock()
 _probe_cache: dict[str, tuple[float, tuple[bool, list[str], float | None]]] = {}
+_backend_probe_state: dict[str, dict[str, Any]] = {}
 _probe_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="probe")
 PROBE_TTL_SEC = 2.5
 
@@ -524,11 +533,62 @@ PROBE_TTL_SEC = 2.5
 _probe_refreshing: set[str] = set()
 
 
+def _store_probe_result(bid: str, result: tuple[bool, list[str], float | None]) -> None:
+    """Cache one real probe and update its consecutive-failure state once."""
+    now = time.time()
+    recovered = False
+    with _probe_lock:
+        _probe_cache[bid] = (now, result)
+        state = _backend_probe_state.setdefault(
+            bid,
+            {"consecutive_failures": 0, "first_failure_at": None, "alerted": False},
+        )
+        if result[0]:
+            recovered = bool(state["alerted"])
+            state.update({"consecutive_failures": 0, "first_failure_at": None, "alerted": False})
+        else:
+            if state["consecutive_failures"] == 0:
+                state["first_failure_at"] = now
+            state["consecutive_failures"] += 1
+    if recovered:
+        alert_id = f"backend-down:{bid}"
+        with _alert_lock:
+            _alert_state.pop(alert_id, None)
+        _dispatch_alert({
+            "id": f"backend-recovered:{bid}",
+            "severity": "recovered",
+            "message": f"{bid} is answering model health checks again",
+            "backend": bid,
+        })
+
+
+def _backend_probe_alert_ready(bid: str, now: float | None = None) -> bool:
+    checked_at = time.time() if now is None else now
+    with _probe_lock:
+        state = _backend_probe_state.get(bid, {})
+        failures = int(state.get("consecutive_failures") or 0)
+        first_failure_at = state.get("first_failure_at")
+    return (
+        failures >= ALERT_BACKEND_FAILURE_THRESHOLD
+        and first_failure_at is not None
+        and checked_at - float(first_failure_at) >= ALERT_BACKEND_FAILURE_GRACE_SEC
+    )
+
+
+def _mark_backend_alerted(bid: str) -> None:
+    with _probe_lock:
+        state = _backend_probe_state.setdefault(
+            bid,
+            {"consecutive_failures": 0, "first_failure_at": None, "alerted": False},
+        )
+        state["alerted"] = True
+
+
 def _probe_refresh(bid: str) -> None:
     be = BACKENDS.get(bid)
     result = backend_healthy(be) if be else (False, [], None)
+    _store_probe_result(bid, result)
     with _probe_lock:
-        _probe_cache[bid] = (time.time(), result)
         _probe_refreshing.discard(bid)
 
 
@@ -549,8 +609,7 @@ def backend_status(bid: str) -> tuple[bool, list[str], float | None]:
             return hit[1]
     be = BACKENDS.get(bid)
     result = backend_healthy(be) if be else (False, [], None)
-    with _probe_lock:
-        _probe_cache[bid] = (time.time(), result)
+    _store_probe_result(bid, result)
     return result
 
 

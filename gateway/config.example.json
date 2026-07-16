@@ -24,6 +24,8 @@
   "alert_cooldown_sec": 900,
   "alert_error_window_sec": 900,
   "alert_error_threshold": 3,
+  "alert_backend_failure_threshold": 3,
+  "alert_backend_failure_grace_sec": 30,
   "backends": {
     "spark1": {
       "name": "Spark One (vLLM)",

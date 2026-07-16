@@ -54,6 +54,29 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(models, ["cloud-model"])
         self.assertEqual(http.call_args.kwargs["headers"], {"Authorization": "provider-secret"})
 
+    def test_backend_alert_requires_repeated_failures_over_grace_period(self):
+        with mock.patch.object(self.server.time, "time", side_effect=[100.0, 115.0, 131.0]):
+            self.server._store_probe_result("cloud", (False, [], None))
+            self.server._store_probe_result("cloud", (False, [], None))
+            self.assertFalse(self.server._backend_probe_alert_ready("cloud", 130.0))
+            self.server._store_probe_result("cloud", (False, [], None))
+        self.assertTrue(self.server._backend_probe_alert_ready("cloud", 131.0))
+
+    def test_backend_recovery_notifies_once_and_resets_incident(self):
+        self.server._backend_probe_state["cloud"] = {
+            "consecutive_failures": 3,
+            "first_failure_at": 100.0,
+            "alerted": True,
+        }
+        self.server._alert_state["backend-down:cloud"] = 130.0
+        with mock.patch.object(self.server, "_dispatch_alert") as dispatch:
+            self.server._store_probe_result("cloud", (True, ["cloud-model"], 25.0))
+            self.server._store_probe_result("cloud", (True, ["cloud-model"], 20.0))
+        dispatch.assert_called_once()
+        self.assertEqual(dispatch.call_args.args[0]["severity"], "recovered")
+        self.assertNotIn("backend-down:cloud", self.server._alert_state)
+        self.assertFalse(self.server._backend_probe_alert_ready("cloud", 200.0))
+
     def test_history_keeps_request_metadata_not_prompt_content(self):
         self.server.record_request("dev-local", "spark", "qwen", False, 200, 12.0, 10, 2, "dev", "Spark")
         history = self.server.history_snapshot(since=time.time() - 10)
