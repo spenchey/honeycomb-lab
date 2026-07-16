@@ -159,6 +159,39 @@ def _comfy_metrics(base_url: str) -> dict[str, Any] | None:
     return metrics if len(metrics) > 1 else None
 
 
+def _llm_workload_metrics(base_url: str, kind: str = "openai", role: str | None = None) -> dict[str, Any]:
+    """Report whether an LLM service is ready and which models it is serving."""
+    root = base_url.rstrip("/")
+    metrics: dict[str, Any] = {"llmKind": kind}
+    if role:
+        metrics["llmRole"] = role
+    if kind == "ollama":
+        data = _fetch_json(root + "/api/ps")
+        if data is None:
+            return {**metrics, "llmReady": False, "llmModels": []}
+        rows = data.get("models")
+        rows = rows if isinstance(rows, list) else []
+        models = [str(row.get("name") or row.get("model")) for row in rows if isinstance(row, dict) and (row.get("name") or row.get("model"))]
+        vram = sum(
+            float(row.get("size_vram") or 0)
+            for row in rows
+            if isinstance(row, dict) and isinstance(row.get("size_vram"), (int, float))
+        )
+        metrics.update({"llmReady": True, "llmModels": models, "llmModelCount": len(models)})
+        if vram > 0:
+            metrics["llmMemUsedMB"] = round(vram / 1024 / 1024)
+        return metrics
+
+    data = _fetch_json(root + "/v1/models")
+    if data is None:
+        return {**metrics, "llmReady": False, "llmModels": []}
+    rows = data.get("data")
+    rows = rows if isinstance(rows, list) else []
+    models = [str(row["id"]) for row in rows if isinstance(row, dict) and row.get("id")]
+    metrics.update({"llmReady": True, "llmModels": models, "llmModelCount": len(models)})
+    return metrics
+
+
 def _vllm_metrics(base_url: str) -> dict[str, Any]:
     import urllib.request
 
@@ -212,6 +245,17 @@ def _probe_vllm_ssh(node: dict[str, Any]) -> dict[str, Any]:
         workload = _comfy_metrics(node["workloadURL"])
         if workload:
             metrics = {**(metrics or {}), **workload}
+    if node.get("llmURL"):
+        llm = _llm_workload_metrics(
+            node["llmURL"],
+            node.get("llmKind", "openai"),
+            node.get("llmRole"),
+        )
+        metrics = {**(metrics or {}), **llm}
+        if llm.get("llmReady"):
+            infer_ok = True
+            if llm.get("llmModels"):
+                models = llm["llmModels"]
     if infer_ok:
         vm = _vllm_metrics(node["baseURL"])
         if vm:

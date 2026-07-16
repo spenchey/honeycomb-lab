@@ -16,7 +16,7 @@ status() {
     ds=true
   fi
   if ssh -o BatchMode=yes -o ConnectTimeout=8 "$PAIR_B" \
-    "curl -fsS --max-time 5 http://127.0.0.1:8188/prompt >/dev/null" 2>/dev/null; then
+    "curl -fsS --max-time 5 http://127.0.0.1:8189/prompt >/dev/null" 2>/dev/null; then
     comfy=true
   fi
   local mode="idle"

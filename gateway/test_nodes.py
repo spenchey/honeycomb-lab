@@ -32,6 +32,47 @@ class NodeMetricsTests(unittest.TestCase):
         self.assertEqual(metrics["gpuMemUsedMB"], 88 * 1024)
         self.assertEqual(metrics["gpuMemTotalMB"], 128 * 1024)
 
+    def test_openai_llm_metrics_report_shared_cluster_role(self):
+        response = {"data": [{"id": "deepseek-v4-flash"}]}
+        with mock.patch.object(nodes, "_fetch_json", return_value=response):
+            metrics = nodes._llm_workload_metrics("http://pair-a:8888", "openai", "worker")
+        self.assertTrue(metrics["llmReady"])
+        self.assertEqual(metrics["llmModels"], ["deepseek-v4-flash"])
+        self.assertEqual(metrics["llmRole"], "worker")
+
+    def test_ollama_llm_metrics_report_loaded_model_memory(self):
+        response = {"models": [{"name": "qwen3.6:35b-a3b", "size_vram": 24 * 1024**3}]}
+        with mock.patch.object(nodes, "_fetch_json", return_value=response):
+            metrics = nodes._llm_workload_metrics("http://spark:11434", "ollama")
+        self.assertTrue(metrics["llmReady"])
+        self.assertEqual(metrics["llmModels"], ["qwen3.6:35b-a3b"])
+        self.assertEqual(metrics["llmMemUsedMB"], 24 * 1024)
+
+    def test_llm_probe_marks_pair_worker_as_serving_shared_model(self):
+        node = {
+            "id": "pair-b",
+            "baseURL": "http://pair-b:8189",
+            "sshHost": "pair-b",
+            "llmURL": "http://pair-a:8888",
+            "llmKind": "openai",
+            "llmRole": "worker",
+            "gpuUtilReliable": False,
+        }
+        with (
+            mock.patch.object(nodes, "_run", return_value=(0, "ok")),
+            mock.patch.object(nodes, "_http_models", return_value=(False, [], None)),
+            mock.patch.object(nodes, "_ssh_metrics", return_value={"memUsedMB": 1000}),
+            mock.patch.object(
+                nodes,
+                "_llm_workload_metrics",
+                return_value={"llmReady": True, "llmModels": ["deepseek-v4-flash"], "llmRole": "worker"},
+            ),
+            mock.patch.object(nodes, "_vllm_metrics", return_value={}),
+        ):
+            result = nodes._probe_vllm_ssh(node)
+        self.assertTrue(result["inferenceOK"])
+        self.assertEqual(result["models"], ["deepseek-v4-flash"])
+
 
 if __name__ == "__main__":
     unittest.main()

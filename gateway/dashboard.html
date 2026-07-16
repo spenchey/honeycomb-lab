@@ -1061,6 +1061,27 @@
         jobsRow.appendChild(jobsValue);
         mb.appendChild(jobsRow);
       }
+      if (m.llmReady != null) {
+        var llmRow = document.createElement("div");
+        llmRow.className = "row";
+        var llmKey = document.createElement("span");
+        llmKey.className = "k";
+        llmKey.textContent = "LLM" + (m.llmRole ? " · " + String(m.llmRole).toUpperCase() : "");
+        var llmValue = document.createElement("span");
+        llmValue.className = "v" + (m.llmReady ? " online" : " offline");
+        var llmModels = Array.isArray(m.llmModels) ? m.llmModels : [];
+        llmValue.textContent = m.llmReady
+          ? ((node.lit ? "ACTIVE · " : "SERVING · ") + (llmModels.length ? truncMiddle(llmModels[0], 28) : "ready"))
+          : "OFF";
+        llmRow.appendChild(llmKey);
+        llmRow.appendChild(llmValue);
+        mb.appendChild(llmRow);
+      }
+      if (m.llmMemUsedMB != null && m.memTotalMB != null) {
+        var llmMemGB = (m.llmMemUsedMB / 1024).toFixed(1);
+        var llmMemPct = m.memTotalMB > 0 ? (m.llmMemUsedMB / m.memTotalMB) * 100 : null;
+        mb.appendChild(buildBar("LLM MEMORY", llmMemPct, llmMemGB + " GB"));
+      }
       if (m.genTokPerSec != null && m.genTokPerSec > 0.05) {
         var tokRow = document.createElement("div");
         tokRow.className = "row";

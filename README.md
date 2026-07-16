@@ -225,7 +225,9 @@ gateway backend so its hex lights on traffic; `pingAlias` enables PING;
 set `gpuUtilReliable` to `false` when a GB10 host reports misleading
 instantaneous utilization. For ComfyUI nodes, `workloadURL` adds live running
 and queued job counts plus unified GPU-memory usage from `/queue` and
-`/system_stats`.
+`/system_stats`. `llmURL`, `llmKind` (`openai` or `ollama`), and `llmRole`
+add serving-model state; a clustered worker may point `llmURL` at the shared
+controller endpoint while retaining its own `llmRole`.
 `container` (+ `sshHost`) enables SERVE/STOP; `doctorCommand` enables
 DOCTOR; `hub: true` marks the center node; `axial: [q, r]` pins the map
 position; top-level `links` adds extra edges between nodes.
