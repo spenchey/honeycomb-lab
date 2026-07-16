@@ -139,8 +139,72 @@ model (embedding models are skipped).
 
 Endpoints: `/v1/chat/completions` · `/v1/completions` · `/v1/embeddings`
 (all proxied, stream + non-stream) · `/health` (backends, activity,
-stats) · `/nodes` (fleet status for the dashboard) · `/requests` (recent
-traffic) · `/control/*` (ping / doctor / container — see security below).
+telemetry) · `/telemetry` (accounted usage by agent, model, device, and the
+combined agent/model/device route) · `/nodes` (fleet status for the dashboard) · `/requests` (recent
+traffic) · `/control/*` (ping / doctor / container / configured pair mode —
+see security below).
+
+### Telemetry
+
+Honeycomb records each routed request by the authenticated agent token, route
+alias, resolved model, configured device, and the combined agent/model/device
+route. Token totals are counted only when the upstream model returns a `usage`
+object; streamed usage can be enabled per backend with `"stream_usage": true`.
+The dashboard's **ACCOUNTED USAGE** strip shows the same data without estimating
+missing tokens. Spark
+nodes show GPU, memory, and CPU through SSH; an HTTP-only endpoint can also
+provide CPU by adding `sshHost` and `metricsCommand` to its fleet entry.
+
+An agent should point at a stable Honeycomb alias such as `dev-local`, not a
+hardware URL. The alias is the centrally managed routing policy; it maps to a
+specific model/device and can have an explicit fallback. Changing a physically
+loaded model is intentionally a separate configured operation, because it
+stops and reloads the serving process.
+
+#### Operational history and alerts
+
+`/telemetry` is the live cumulative view. The gateway also writes a
+metadata-only JSONL ledger (no prompts, completions, or credentials) and
+serves time-window data at `/telemetry/history?since=<unix-seconds>`. This
+makes daily reporting, error-rate review, and capacity decisions reproducible.
+`/alerts` reports unavailable, slow, or repeatedly failing backends. Set
+`alert_webhook` to an `env:VARIABLE_NAME` reference to deliver those alerts to
+a Slack-compatible incoming webhook; alerts are de-duplicated by cooldown.
+Alternatively, `alert_command` may be an explicit argv list for a protected
+local sender such as `Scripts/send-honeycomb-alert.py`; its generated alert
+message is appended as the final argument. Honeycomb never accepts alert
+commands from a browser or agent request.
+
+#### Authenticated cloud providers
+
+Honeycomb can proxy any provider that exposes a compatible OpenAI API, but
+provider credentials are never placed in agent configuration, dashboard code,
+or committed JSON. Add a backend with a header reference such as:
+
+```json
+"headers": { "Authorization": "env:HONEYCOMB_PROVIDER_API_KEY" }
+```
+
+Then put that environment variable only in the gateway service environment.
+Honeycomb uses it for health checks and proxied requests, while each agent
+still authenticates to Honeycomb with its own inference token. First test a
+dedicated non-production alias; do not move a working production cloud agent
+until its smoke test and usage accounting are confirmed.
+
+#### Safe model profiles and audit trail
+
+The gateway never accepts a shell command from the browser. A fleet node may
+declare named `modelProfiles`, each with an `activateCommand`, optional
+`verifyCommand`, and optional `rollbackCommand`. `POST /control/profile`
+requires a control token and an exact profile-name confirmation. Every control
+action is appended to the protected `/audit` trail. This keeps a physical model
+swap explicit, testable, and recoverable instead of mixing it into model alias
+routing.
+
+`links` may be topology-only `["node-a", "node-b"]` or declare a configured
+SSH `checkHost` and `checkCommand`. Honeycomb labels topology-only links
+**unverified** rather than claiming a cabled Spark fabric is healthy without a
+real link probe.
 
 ## fleet.json
 
@@ -158,6 +222,12 @@ var overrides the path). Start from `fleet.example.json`.
 
 **Per-node fields:** `gatewayBackend` + `litAliases` map the node to a
 gateway backend so its hex lights on traffic; `pingAlias` enables PING;
+set `gpuUtilReliable` to `false` when a GB10 host reports misleading
+instantaneous utilization. For ComfyUI nodes, `workloadURL` adds live running
+and queued job counts plus unified GPU-memory usage from `/queue` and
+`/system_stats`. `llmURL`, `llmKind` (`openai` or `ollama`), and `llmRole`
+add serving-model state; a clustered worker may point `llmURL` at the shared
+controller endpoint while retaining its own `llmRole`.
 `container` (+ `sshHost`) enables SERVE/STOP; `doctorCommand` enables
 DOCTOR; `hub: true` marks the center node; `axial: [q, r]` pins the map
 position; top-level `links` adds extra edges between nodes.
@@ -169,6 +239,9 @@ Full feature parity: map, LIT pulses, inspector with metrics + latency
 trend, traffic feed, and PING/DOCTOR/SERVE/STOP.
 
 **Security model:**
+- Model requests require an `Authorization: Bearer <agent-token>` header when
+  `api_tokens` is configured. Give each agent a different token. An inference
+  token can route requests but cannot operate a machine.
 - Control actions (`/control/*`) require the `X-Honeycomb-Token` header
   from anywhere but localhost. Set `control_token` in `config.json`
   (`openssl rand -hex 16`); the dashboard prompts once and remembers it.

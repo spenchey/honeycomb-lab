@@ -17,6 +17,8 @@ import hmac
 import ipaddress
 import json
 import os
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -26,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("HONEYCOMB_GATEWAY_CONFIG", ROOT / "config.json"))
@@ -87,12 +89,33 @@ ACTIVE_WINDOW_SEC = 8.0
 _requests_lock = threading.Lock()
 _request_log: collections.deque[dict[str, Any]] = collections.deque(maxlen=50)
 
-# Per-alias cumulative stats, persisted to stats.json (thread-safe)
+# Cumulative telemetry, persisted to stats.json. Each successful or failed
+# gateway request is accounted for by agent, route, model, and device. We only
+# count tokens when the upstream API actually reported them; no estimates.
 STATS_PATH = ROOT / "stats.json"
+EVENTS_PATH = Path(CFG.get("telemetry_events_path") or ROOT / "telemetry-events.jsonl").expanduser()
+AUDIT_PATH = Path(CFG.get("audit_log_path") or ROOT / "control-audit.jsonl").expanduser()
 STATS_WRITE_INTERVAL_SEC = 30.0
 _stats_lock = threading.Lock()
-_stats: dict[str, dict[str, Any]] = {}
+_stats: dict[str, dict[str, dict[str, Any]]] = {
+    "by_agent": {},
+    "by_alias": {},
+    "by_model": {},
+    "by_device": {},
+    "by_agent_model_device": {},
+}
 _stats_last_write = 0.0
+
+# Alerts deliberately describe observable failure, never model prompts or
+# credentials. They are evaluated from the same request and health evidence
+# exposed by the gateway, and are de-duplicated before an optional webhook.
+_alert_lock = threading.Lock()
+_alert_state: dict[str, float] = {}
+ALERT_COOLDOWN_SEC = int(CFG.get("alert_cooldown_sec") or 900)
+ALERT_ERROR_WINDOW_SEC = int(CFG.get("alert_error_window_sec") or 900)
+ALERT_ERROR_THRESHOLD = int(CFG.get("alert_error_threshold") or 3)
+ALERT_BACKEND_FAILURE_THRESHOLD = max(1, int(CFG.get("alert_backend_failure_threshold") or 3))
+ALERT_BACKEND_FAILURE_GRACE_SEC = max(0, int(CFG.get("alert_backend_failure_grace_sec") or 30))
 
 
 def _load_stats() -> None:
@@ -101,7 +124,22 @@ def _load_stats() -> None:
         with STATS_PATH.open() as f:
             data = json.load(f)
         if isinstance(data, dict):
-            _stats = data
+            # Migrate the pre-telemetry flat per-alias file without losing it.
+            if "by_alias" not in data:
+                data = {
+                    "by_agent": {},
+                    "by_alias": data,
+                    "by_model": {},
+                    "by_device": {},
+                    "by_agent_model_device": {},
+                }
+            _stats = {
+                key: value if isinstance(value, dict) else {}
+                for key, value in data.items()
+                if key in ("by_agent", "by_alias", "by_model", "by_device", "by_agent_model_device")
+            }
+            for key in ("by_agent", "by_alias", "by_model", "by_device", "by_agent_model_device"):
+                _stats.setdefault(key, {})
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -124,15 +162,120 @@ def _save_stats_if_due() -> None:
         log(f"stats save failed: {e}")
 
 
+def _append_jsonl(path: Path, entry: dict[str, Any]) -> None:
+    """Append an operational event atomically enough for the local gateway.
+
+    The caller must never put prompts, completions, or credentials in entry.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+    except Exception as e:
+        log(f"event log write failed: {e}")
+
+
+def _read_jsonl(path: Path, since: float | None = None, limit: int = 5000) -> list[dict[str, Any]]:
+    """Read bounded, structured operational history without failing requests."""
+    if limit < 1:
+        return []
+    try:
+        with path.open(encoding="utf-8") as f:
+            rows: collections.deque[dict[str, Any]] = collections.deque(maxlen=limit)
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                if since is not None and float(row.get("ts") or 0) < since:
+                    continue
+                rows.append(row)
+            return list(rows)
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        log(f"event log read failed: {e}")
+        return []
+
+
+def _summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
+    summary: dict[str, dict[str, Any]] = {}
+    for event in events:
+        key = " | ".join((str(event.get("agent") or "unknown"), str(event.get("model") or "unknown"), str(event.get("device") or event.get("backend") or "unknown")))
+        bucket = summary.setdefault(key, {"requests": 0, "errors": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_duration_ms": 0.0})
+        bucket["requests"] += 1
+        if int(event.get("status") or 0) >= 400 or int(event.get("status") or 0) == 0:
+            bucket["errors"] += 1
+        bucket["prompt_tokens"] += int(event.get("prompt_tokens") or 0)
+        bucket["completion_tokens"] += int(event.get("completion_tokens") or 0)
+        bucket["total_duration_ms"] += float(event.get("duration_ms") or 0.0)
+    for bucket in summary.values():
+        requests = bucket["requests"]
+        bucket["avg_duration_ms"] = round(bucket.pop("total_duration_ms") / requests, 1) if requests else None
+    return summary
+
+
+def history_snapshot(since: float | None = None, limit: int = 5000) -> dict[str, Any]:
+    events = _read_jsonl(EVENTS_PATH, since=since, limit=limit)
+    return {"since": since, "events": events, "summary": _summarize_events(events)}
+
+
+def audit_event(action: str, actor: str, result: dict[str, Any], node: str | None = None, profile: str | None = None) -> None:
+    _append_jsonl(AUDIT_PATH, {
+        "ts": time.time(), "action": action, "actor": actor, "node": node,
+        "profile": profile, "ok": bool(result.get("ok")),
+        "message": str(result.get("message") or result.get("error") or "")[:300],
+    })
+
+
+def _safe_env_header(value: str) -> str | None:
+    """Resolve only explicit env:NAME references, never config literals."""
+    if not isinstance(value, str) or not value.startswith("env:"):
+        return None
+    name = value.removeprefix("env:")
+    if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", name):
+        return None
+    return os.environ.get(name) or None
+
+
+def upstream_headers(backend: dict[str, Any]) -> dict[str, str]:
+    """Headers for an upstream provider, sourced only from environment vars.
+
+    Example backend config: {"headers": {"Authorization": "env:OLLAMA_KEY"}}.
+    Plaintext headers are rejected so keys cannot be committed to fleet config.
+    """
+    configured = backend.get("headers") or {}
+    if not isinstance(configured, dict):
+        return {}
+    out: dict[str, str] = {}
+    for name, value in configured.items():
+        if not isinstance(name, str) or name.lower() in ("host", "content-length"):
+            continue
+        secret = _safe_env_header(value)
+        if secret:
+            out[name] = secret
+    return out
+
+
+def backend_auth_ready(backend: dict[str, Any]) -> bool:
+    configured = backend.get("headers") or {}
+    if not isinstance(configured, dict):
+        return False
+    return all(_safe_env_header(value) for value in configured.values())
+
+
 def stats_snapshot() -> dict[str, Any]:
     with _stats_lock:
-        return {k: dict(v) for k, v in _stats.items()}
+        return {group: {key: dict(value) for key, value in values.items()} for group, values in _stats.items()}
 
 
 MAX_STATS_KEYS = 200
 
 
-def _update_stats(
+def _update_stats_bucket(
+    bucket: dict[str, dict[str, Any]],
     key: str,
     status: int | None,
     duration_ms: float | None,
@@ -140,31 +283,27 @@ def _update_stats(
     completion_tokens: int | None,
 ) -> None:
     is_error = status is None or status == 0 or status >= 400
-    with _stats_lock:
-        # Keys come from client-supplied model names — cap so a chatty or
-        # malicious client can't grow memory/disk without bound.
-        if key not in _stats and len(_stats) >= MAX_STATS_KEYS:
-            key = "(other)"
-        s = _stats.setdefault(
-            key,
-            {
-                "requests": 0,
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_duration_ms": 0.0,
-                "errors": 0,
-            },
-        )
-        s["requests"] += 1
-        if prompt_tokens:
-            s["prompt_tokens"] += prompt_tokens
-        if completion_tokens:
-            s["completion_tokens"] += completion_tokens
-        if duration_ms:
-            s["total_duration_ms"] += duration_ms
-        if is_error:
-            s["errors"] += 1
-    _save_stats_if_due()
+    if key not in bucket and len(bucket) >= MAX_STATS_KEYS:
+        key = "(other)"
+    s = bucket.setdefault(
+        key,
+        {
+            "requests": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_duration_ms": 0.0,
+            "errors": 0,
+        },
+    )
+    s["requests"] += 1
+    if prompt_tokens:
+        s["prompt_tokens"] += prompt_tokens
+    if completion_tokens:
+        s["completion_tokens"] += completion_tokens
+    if duration_ms:
+        s["total_duration_ms"] += duration_ms
+    if is_error:
+        s["errors"] += 1
 
 
 def record_request(
@@ -176,6 +315,8 @@ def record_request(
     duration_ms: float | None,
     prompt_tokens: int | None,
     completion_tokens: int | None,
+    client: str | None,
+    device: str | None,
 ) -> None:
     entry = {
         "ts": time.time(),
@@ -187,10 +328,101 @@ def record_request(
         "duration_ms": duration_ms,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
+        "agent": client,
+        "device": device,
     }
     with _requests_lock:
         _request_log.append(entry)
-    _update_stats(alias or model, status, duration_ms, prompt_tokens, completion_tokens)
+    with _stats_lock:
+        _update_stats_bucket(_stats["by_agent"], client or "unknown", status, duration_ms, prompt_tokens, completion_tokens)
+        _update_stats_bucket(_stats["by_alias"], alias or model, status, duration_ms, prompt_tokens, completion_tokens)
+        _update_stats_bucket(_stats["by_model"], model, status, duration_ms, prompt_tokens, completion_tokens)
+        _update_stats_bucket(_stats["by_device"], device or backend, status, duration_ms, prompt_tokens, completion_tokens)
+        route_key = " | ".join((client or "unknown", model, device or backend))
+        _update_stats_bucket(
+            _stats["by_agent_model_device"],
+            route_key,
+            status,
+            duration_ms,
+            prompt_tokens,
+            completion_tokens,
+        )
+    # Durable history powers time-window reporting and alert diagnosis. It is
+    # metadata only: prompts, responses, tokens, and credentials never enter.
+    _append_jsonl(EVENTS_PATH, entry)
+    _save_stats_if_due()
+    evaluate_alerts()
+
+
+def _dispatch_alert(alert: dict[str, Any]) -> None:
+    """Optionally send a compact alert to a configured Slack-compatible hook.
+
+    Absence of the webhook is intentional: the alert remains visible at
+    /alerts instead of silently attempting network delivery.
+    """
+    message = f"Honeycomb {alert['severity']}: {alert['message']}"
+    # A local command is useful when the existing Slack bot credential lives
+    # in a protected Hermes profile rather than an incoming-webhook variable.
+    # It is an operator-configured argv list, never supplied by a request.
+    command = CFG.get("alert_command")
+    if isinstance(command, list) and command and all(isinstance(part, str) and part for part in command):
+        try:
+            result = subprocess.run(command + [message], capture_output=True, text=True, timeout=15, check=False)
+            if result.returncode != 0:
+                log(f"alert command failed ({result.returncode}): {result.stderr.strip()[:200]}")
+        except Exception as e:
+            log(f"alert command failed: {e}")
+        return
+    webhook = _safe_env_header(str(CFG.get("alert_webhook") or ""))
+    if not webhook:
+        return
+    payload = json.dumps({"text": message}).encode()
+    try:
+        http_json("POST", webhook, body=payload, timeout=5.0)
+    except Exception as e:
+        log(f"alert delivery failed: {e}")
+
+
+def evaluate_alerts() -> list[dict[str, Any]]:
+    """Return active backend/error alerts and notify only on state change."""
+    now = time.time()
+    alerts: list[dict[str, Any]] = []
+    for backend_id, (healthy, _, latency) in all_backend_status().items():
+        if not healthy and _backend_probe_alert_ready(backend_id, now):
+            alerts.append({
+                "id": f"backend-down:{backend_id}", "severity": "high",
+                "message": (
+                    f"{backend_id} failed {ALERT_BACKEND_FAILURE_THRESHOLD} consecutive model health checks "
+                    f"over at least {ALERT_BACKEND_FAILURE_GRACE_SEC} seconds"
+                ),
+                "backend": backend_id,
+            })
+        elif latency is not None and latency > float(CFG.get("alert_latency_ms") or 5000):
+            alerts.append({
+                "id": f"backend-slow:{backend_id}", "severity": "medium",
+                "message": f"{backend_id} health check is slow ({round(latency)} ms)", "backend": backend_id,
+            })
+    recent = _read_jsonl(EVENTS_PATH, since=now - ALERT_ERROR_WINDOW_SEC, limit=2000)
+    failures: dict[str, int] = {}
+    for event in recent:
+        if int(event.get("status") or 0) == 0 or int(event.get("status") or 0) >= 400:
+            backend = str(event.get("backend") or "unknown")
+            failures[backend] = failures.get(backend, 0) + 1
+    for backend, count in failures.items():
+        if count >= ALERT_ERROR_THRESHOLD:
+            alerts.append({
+                "id": f"request-errors:{backend}", "severity": "high",
+                "message": f"{backend} had {count} failed requests in the last {ALERT_ERROR_WINDOW_SEC // 60} minutes", "backend": backend,
+            })
+    with _alert_lock:
+        for alert in alerts:
+            last = _alert_state.get(alert["id"], 0.0)
+            if now - last >= ALERT_COOLDOWN_SEC:
+                _alert_state[alert["id"]] = now
+                if alert["id"].startswith("backend-down:"):
+                    _mark_backend_alerted(alert["backend"])
+                _dispatch_alert(alert)
+    return alerts
 
 
 def log(msg: str) -> None:
@@ -271,10 +503,12 @@ def http_json(
         return 0, {}, json.dumps({"error": {"message": str(e), "type": "gateway_error"}}).encode()
 
 
-def backend_healthy(base_url: str) -> tuple[bool, list[str], float | None]:
-    url = base_url.rstrip("/") + "/models"
+def backend_healthy(backend: dict[str, Any]) -> tuple[bool, list[str], float | None]:
+    """Health check a backend, including its configured upstream auth."""
+    base_url = str(backend["base_url"])
+    url = base_url.rstrip("/") + str(backend.get("models_path") or "/models")
     t0 = time.perf_counter()
-    status, _, raw = http_json("GET", url, timeout=3.0)
+    status, _, raw = http_json("GET", url, headers=upstream_headers(backend), timeout=3.0)
     ms = (time.perf_counter() - t0) * 1000
     if status != 200:
         return False, [], None
@@ -291,6 +525,7 @@ def backend_healthy(base_url: str) -> tuple[bool, list[str], float | None]:
 # for a couple of seconds.
 _probe_lock = threading.Lock()
 _probe_cache: dict[str, tuple[float, tuple[bool, list[str], float | None]]] = {}
+_backend_probe_state: dict[str, dict[str, Any]] = {}
 _probe_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="probe")
 PROBE_TTL_SEC = 2.5
 
@@ -298,11 +533,62 @@ PROBE_TTL_SEC = 2.5
 _probe_refreshing: set[str] = set()
 
 
+def _store_probe_result(bid: str, result: tuple[bool, list[str], float | None]) -> None:
+    """Cache one real probe and update its consecutive-failure state once."""
+    now = time.time()
+    recovered = False
+    with _probe_lock:
+        _probe_cache[bid] = (now, result)
+        state = _backend_probe_state.setdefault(
+            bid,
+            {"consecutive_failures": 0, "first_failure_at": None, "alerted": False},
+        )
+        if result[0]:
+            recovered = bool(state["alerted"])
+            state.update({"consecutive_failures": 0, "first_failure_at": None, "alerted": False})
+        else:
+            if state["consecutive_failures"] == 0:
+                state["first_failure_at"] = now
+            state["consecutive_failures"] += 1
+    if recovered:
+        alert_id = f"backend-down:{bid}"
+        with _alert_lock:
+            _alert_state.pop(alert_id, None)
+        _dispatch_alert({
+            "id": f"backend-recovered:{bid}",
+            "severity": "recovered",
+            "message": f"{bid} is answering model health checks again",
+            "backend": bid,
+        })
+
+
+def _backend_probe_alert_ready(bid: str, now: float | None = None) -> bool:
+    checked_at = time.time() if now is None else now
+    with _probe_lock:
+        state = _backend_probe_state.get(bid, {})
+        failures = int(state.get("consecutive_failures") or 0)
+        first_failure_at = state.get("first_failure_at")
+    return (
+        failures >= ALERT_BACKEND_FAILURE_THRESHOLD
+        and first_failure_at is not None
+        and checked_at - float(first_failure_at) >= ALERT_BACKEND_FAILURE_GRACE_SEC
+    )
+
+
+def _mark_backend_alerted(bid: str) -> None:
+    with _probe_lock:
+        state = _backend_probe_state.setdefault(
+            bid,
+            {"consecutive_failures": 0, "first_failure_at": None, "alerted": False},
+        )
+        state["alerted"] = True
+
+
 def _probe_refresh(bid: str) -> None:
     be = BACKENDS.get(bid)
-    result = backend_healthy(be["base_url"]) if be else (False, [], None)
+    result = backend_healthy(be) if be else (False, [], None)
+    _store_probe_result(bid, result)
     with _probe_lock:
-        _probe_cache[bid] = (time.time(), result)
         _probe_refreshing.discard(bid)
 
 
@@ -322,9 +608,8 @@ def backend_status(bid: str) -> tuple[bool, list[str], float | None]:
                 _probe_pool.submit(_probe_refresh, bid)
             return hit[1]
     be = BACKENDS.get(bid)
-    result = backend_healthy(be["base_url"]) if be else (False, [], None)
-    with _probe_lock:
-        _probe_cache[bid] = (time.time(), result)
+    result = backend_healthy(be) if be else (False, [], None)
+    _store_probe_result(bid, result)
     return result
 
 
@@ -471,6 +756,7 @@ def _proxy_attempt(
     suffix: str,
     payload: dict[str, Any],
     requested_model: str,
+    client: str | None,
 ) -> tuple[int, bytes]:
     """One non-stream proxy attempt to a specific backend. Records activity + stats."""
     be = BACKENDS[bid]
@@ -486,7 +772,9 @@ def _proxy_attempt(
     activity_begin(bid, upstream, alias or requested_model)
     t0 = time.perf_counter()
     try:
-        status, _, resp = http_json("POST", target, body=body, timeout=300.0)
+        status, _, resp = http_json(
+            "POST", target, body=body, headers=upstream_headers(be), timeout=300.0
+        )
     finally:
         activity_end(bid)
     duration_ms = (time.perf_counter() - t0) * 1000
@@ -500,7 +788,7 @@ def _proxy_attempt(
     record_request(
         alias or requested_model, bid, upstream, False,
         status if status else 502, duration_ms,
-        prompt_tokens, completion_tokens,
+        prompt_tokens, completion_tokens, client, str(be.get("device") or bid),
     )
     return status, resp
 
@@ -557,7 +845,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
-        path = urlparse(self.path).path.rstrip("/") or "/"
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        query = parse_qs(parsed.query)
 
         # Browsers get the dashboard at /; API clients keep getting JSON.
         wants_html = "text/html" in (self.headers.get("Accept") or "")
@@ -599,6 +889,8 @@ class Handler(BaseHTTPRequestHandler):
                     "seconds_since_request": a.get("seconds_since_request"),
                     "last_model": a.get("last_model"),
                     "last_alias": a.get("last_alias"),
+                    "upstream_auth_configured": bool(be.get("headers")),
+                    "upstream_auth_ready": backend_auth_ready(be) if be.get("headers") else True,
                 }
             # Map gateway backends → Honeycomb hex ids for the Mac app
             node_activity = {
@@ -637,6 +929,31 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/models":
             data = {"object": "list", "data": merge_models()}
             self._send(200, json.dumps(data).encode())
+            return
+
+        if path == "/telemetry":
+            self._send(200, json.dumps({"telemetry": stats_snapshot()}).encode())
+            return
+
+        if path == "/telemetry/history":
+            try:
+                since = float(query.get("since", [""])[0]) if query.get("since") else None
+                limit = min(max(int(query.get("limit", ["1000"])[0]), 1), 5000)
+            except ValueError:
+                self._send(400, json.dumps({"error": {"message": "invalid since or limit"}}).encode())
+                return
+            self._send(200, json.dumps(history_snapshot(since=since, limit=limit)).encode())
+            return
+
+        if path == "/alerts":
+            self._send(200, json.dumps({"alerts": evaluate_alerts()}).encode())
+            return
+
+        if path == "/audit":
+            if not self._control_authorized():
+                self._send(401, json.dumps({"error": {"message": "control token required"}}).encode(), cors=False)
+                return
+            self._send(200, json.dumps({"events": _read_jsonl(AUDIT_PATH, limit=500)}).encode(), cors=False)
             return
 
         if path == "/requests":
@@ -686,6 +1003,25 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return self._token_valid()
 
+    def _api_client(self) -> str | None:
+        """Return the named API client for a valid inference token.
+
+        Model calls are deliberately separate from dashboard controls: an
+        agent gets only an inference credential, never the control-plane
+        credential that can start or stop a Spark container.
+        """
+        auth = self.headers.get("Authorization") or ""
+        supplied = auth.removeprefix("Bearer ").strip()
+        if not supplied:
+            supplied = (self.headers.get("X-Honeycomb-API-Token") or "").strip()
+        tokens = CFG.get("api_tokens") or {}
+        if not supplied or not isinstance(tokens, dict):
+            return None
+        for client, token in tokens.items():
+            if isinstance(token, str) and token and hmac.compare_digest(supplied, token):
+                return str(client)
+        return None
+
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path.rstrip("/") or "/"
 
@@ -702,14 +1038,33 @@ class Handler(BaseHTTPRequestHandler):
             node_id = str(body.get("node") or "")
             action = path.removeprefix("/control/")
             if action == "ping":
-                result = fleet_nodes.action_ping(node_id, int(CFG.get("listen_port", 4000)))
+                host = CFG.get("listen_host", "127.0.0.1")
+                port = int(CFG.get("listen_port", 4000))
+                result = fleet_nodes.action_ping(
+                    node_id,
+                    f"http://{host}:{port}",
+                    str(CFG.get("internal_api_token") or ""),
+                )
             elif action == "doctor":
                 result = fleet_nodes.action_doctor(node_id)
             elif action == "container":
                 result = fleet_nodes.action_container(node_id, str(body.get("verb") or ""))
+            elif action == "mode":
+                result = fleet_nodes.action_mode(node_id, str(body.get("mode") or ""))
+            elif action == "profile":
+                profile = str(body.get("profile") or "")
+                # Changing a physical model is disruptive. A caller must say
+                # exactly which named profile it intends to activate; the
+                # browser never gets to submit a shell command.
+                if body.get("confirm") != profile:
+                    result = {"ok": False, "error": "profile confirmation must match the profile name"}
+                else:
+                    result = fleet_nodes.action_profile(node_id, profile)
             else:
                 self._send(404, json.dumps({"error": {"message": f"unknown action {action}"}}).encode(), cors=False)
                 return
+            actor = "local" if self.client_address[0] in ("127.0.0.1", "::1") else "dashboard"
+            audit_event(action, actor, result, node=node_id, profile=str(body.get("profile") or "") or None)
             log(f"control {action} node={node_id!r} ok={result.get('ok')}")
             self._send(200, json.dumps(result).encode(), cors=False)
             return
@@ -720,6 +1075,11 @@ class Handler(BaseHTTPRequestHandler):
             "/v1/embeddings",
         ):
             self._send(404, json.dumps({"error": {"message": f"not found: {path}"}}).encode())
+            return
+
+        api_client = self._api_client()
+        if api_client is None:
+            self._send(401, json.dumps({"error": {"message": "Honeycomb API token required"}}).encode())
             return
 
         raw = self._read_body()
@@ -781,6 +1141,15 @@ class Handler(BaseHTTPRequestHandler):
         suffix = path[len("/v1") :]  # /chat/completions
 
         if stream:
+            # SGLang can report final streamed usage when asked. Keep this
+            # opt-in per backend so an older OpenAI-compatible server is never
+            # given an unsupported request field.
+            if be.get("stream_usage") and path == "/v1/chat/completions":
+                options = payload.get("stream_options")
+                if not isinstance(options, dict):
+                    options = {}
+                    payload["stream_options"] = options
+                options.setdefault("include_usage", True)
             payload["model"] = upstream
             body = json.dumps(payload).encode()
             target = base + suffix
@@ -790,20 +1159,59 @@ class Handler(BaseHTTPRequestHandler):
             activity_begin(bid, upstream, alias or model)
             t0 = time.perf_counter()
             try:
-                self._proxy_stream(target, body)
+                status, prompt_tokens, completion_tokens = self._proxy_stream(
+                    target, body, upstream_headers(be), defer_error=True
+                )
                 record_request(
                     alias or model, bid, upstream, True,
-                    None, (time.perf_counter() - t0) * 1000, None, None,
+                    status, (time.perf_counter() - t0) * 1000, prompt_tokens, completion_tokens,
+                    api_client, str(be.get("device") or bid),
                 )
             finally:
                 activity_end(bid)
+            # A stream that has already sent a 200 cannot be safely moved to
+            # another model. But an upstream error before headers is a normal
+            # retry case and follows the same explicit alias failover policy.
+            alias_failover = bool((ALIASES.get(model) or {}).get("failover"))
+            do_failover = failover_requested or model == "any" or alias_failover
+            if do_failover and (status is None or status == 0 or status >= 500):
+                tried = {bid}
+                for candidate in CHEAP_ORDER:
+                    if candidate in tried:
+                        continue
+                    tried.add(candidate)
+                    healthy, models, _ = backend_status(candidate)
+                    candidates = [m for m in models if "embed" not in m.lower()] if healthy else []
+                    if not candidates:
+                        continue
+                    next_backend = BACKENDS[candidate]
+                    activity_begin(candidate, candidates[0], alias or model)
+                    retry_t0 = time.perf_counter()
+                    try:
+                        status, prompt_tokens, completion_tokens = self._proxy_stream(
+                            next_backend["base_url"].rstrip("/") + suffix,
+                            json.dumps({**payload, "model": candidates[0]}).encode(),
+                            upstream_headers(next_backend), defer_error=True,
+                        )
+                        record_request(
+                            alias or model, candidate, candidates[0], True, status,
+                            (time.perf_counter() - retry_t0) * 1000, prompt_tokens, completion_tokens,
+                            api_client, str(next_backend.get("device") or candidate),
+                        )
+                    finally:
+                        activity_end(candidate)
+                    if status not in (None, 0) and status < 500:
+                        break
+            if status is None or status == 0 or status >= 400:
+                self._send(502 if status in (None, 0) else int(status), json.dumps({"error": {"message": "upstream stream failed"}}).encode())
             return
 
         # Non-stream: proxy, and on upstream failure with failover enabled
         # (explicit "failover": true, or the "any" alias) retry once per
         # remaining CHEAP_ORDER backend before giving up.
-        do_failover = failover_requested or model == "any"
-        status, resp = _proxy_attempt(bid, upstream, alias, suffix, payload, model)
+        alias_failover = bool((ALIASES.get(model) or {}).get("failover"))
+        do_failover = failover_requested or model == "any" or alias_failover
+        status, resp = _proxy_attempt(bid, upstream, alias, suffix, payload, model, api_client)
 
         if do_failover and (status == 0 or status >= 500):
             tried = {bid}
@@ -818,7 +1226,7 @@ class Handler(BaseHTTPRequestHandler):
                 log(f"failover: {bid} failed (status={status}) → trying {cand_bid}")
                 bid = cand_bid
                 upstream = chat_models[0]
-                status, resp = _proxy_attempt(bid, upstream, alias, suffix, payload, model)
+                status, resp = _proxy_attempt(bid, upstream, alias, suffix, payload, model, api_client)
                 if not (status == 0 or status >= 500):
                     break
 
@@ -827,13 +1235,22 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(status if status else 502, resp)
 
-    def _proxy_stream(self, url: str, body: bytes) -> None:
+    def _proxy_stream(
+        self, url: str, body: bytes, headers: dict[str, str] | None = None, defer_error: bool = False
+    ) -> tuple[int | None, int | None, int | None]:
         req = urllib.request.Request(url, data=body, method="POST")
         req.add_header("Content-Type", "application/json")
         req.add_header("Accept", "text/event-stream")
+        for name, value in (headers or {}).items():
+            if name.lower() not in ("host", "content-length"):
+                req.add_header(name, value)
         headers_sent = False
+        status: int | None = None
+        prompt_tokens = completion_tokens = None
+        remainder = ""
         try:
             with urllib.request.urlopen(req, timeout=300.0) as resp:
+                status = resp.status
                 self.send_response(resp.status)
                 ctype = resp.headers.get("Content-Type", "text/event-stream")
                 self.send_header("Content-Type", ctype)
@@ -848,23 +1265,42 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
                     self.wfile.flush()
+                    # OpenAI SSE usage arrives in a final data event. Chunk
+                    # boundaries are arbitrary, so preserve a partial line.
+                    remainder += chunk.decode("utf-8", errors="ignore")
+                    lines = remainder.split("\n")
+                    remainder = lines.pop()
+                    for line in lines:
+                        if not line.startswith("data:"):
+                            continue
+                        raw = line.removeprefix("data:").strip()
+                        if not raw or raw == "[DONE]":
+                            continue
+                        try:
+                            usage = (json.loads(raw).get("usage") or {})
+                            prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+                            completion_tokens = usage.get("completion_tokens", completion_tokens)
+                        except Exception:
+                            pass
         except (BrokenPipeError, ConnectionResetError):
             # Client hung up mid-stream (closed the chat) — normal, not an error.
             log("stream client disconnected")
         except urllib.error.HTTPError as e:
+            status = e.code
             err = e.read()
-            if not headers_sent:
+            if not headers_sent and not defer_error:
                 self._send(e.code, err or json.dumps({"error": str(e)}).encode())
         except Exception as e:
             # Once the 200 + headers are on the wire we can't send a second
             # response — just log and drop the connection.
             if headers_sent:
                 log(f"stream error after headers: {e}")
-            else:
+            elif not defer_error:
                 self._send(
                     502,
                     json.dumps({"error": {"message": str(e), "type": "stream_error"}}).encode(),
                 )
+        return status, prompt_tokens, completion_tokens
 
 
 def main() -> None:
@@ -875,7 +1311,7 @@ def main() -> None:
     log(f"Honeycomb gateway → http://{host}:{port}")
     log(f"config: {CONFIG_PATH}")
     for bid, be in BACKENDS.items():
-        ok, models, ms = backend_healthy(be["base_url"])
+        ok, models, ms = backend_healthy(be)
         st = "UP" if ok else "DOWN"
         log(f"  backend {bid:8} {st:4}  {be['base_url']}  models={models[:3]}  {f'{ms:.0f}ms' if ms else ''}")
     log(f"default model alias: {DEFAULT_MODEL}")

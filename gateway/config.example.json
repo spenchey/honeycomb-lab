@@ -7,11 +7,38 @@
     "spark1"
   ],
   "control_token": "__REPLACE_ME__",
+  "api_tokens": {
+    "dev": "__REPLACE_WITH_A_UNIQUE_AGENT_TOKEN__",
+    "honeycomb-dashboard": "__REPLACE_WITH_A_PRIVATE_INTERNAL_TOKEN__"
+  },
+  "internal_api_token": "__SAME_VALUE_AS_honeycomb-dashboard__",
+  "telemetry_events_path": "~/Library/Application Support/Honeycomb/telemetry-events.jsonl",
+  "audit_log_path": "~/Library/Application Support/Honeycomb/control-audit.jsonl",
+  "alert_webhook": "env:HONEYCOMB_ALERT_WEBHOOK",
+  "alert_command": [
+    "/usr/bin/python3",
+    "/absolute/path/to/send-honeycomb-alert.py",
+    "--channel",
+    "C0123ABCDE"
+  ],
+  "alert_cooldown_sec": 900,
+  "alert_error_window_sec": 900,
+  "alert_error_threshold": 3,
+  "alert_backend_failure_threshold": 3,
+  "alert_backend_failure_grace_sec": 30,
   "backends": {
     "spark1": {
       "name": "Spark One (vLLM)",
       "base_url": "http://192.168.1.50:8000/v1",
       "kind": "vllm"
+    },
+    "cloud-example": {
+      "name": "Authenticated OpenAI-compatible provider",
+      "base_url": "https://provider.example/v1",
+      "kind": "http",
+      "headers": {
+        "Authorization": "env:HONEYCOMB_PROVIDER_API_KEY"
+      }
     },
     "lms": {
       "name": "LM Studio on the hub",
@@ -23,6 +50,11 @@
     "spark-main": {
       "backend": "spark1",
       "upstream_model": null
+    },
+    "dev-local": {
+      "backend": "spark1",
+      "upstream_model": null,
+      "failover": true
     },
     "local-lms": {
       "backend": "lms",

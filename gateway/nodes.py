@@ -96,24 +96,100 @@ def _http_models(base_url: str, models_path: str) -> tuple[bool, list[str], floa
         return False, [], None
 
 
-def _ssh_metrics(host: str) -> dict[str, Any] | None:
-    cmd = (
-        "free -m | awk '/^Mem:/{print $3, $2}'; "
-        "nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits"
+def _ssh_metrics(
+    host: str,
+    custom_command: str | None = None,
+    include_gpu_util: bool = True,
+) -> dict[str, Any] | None:
+    cmd = custom_command or (
+        "free -m | awk '/^Mem:/{print \"MEM \" $3 \" \" $2}'; "
+        "LC_ALL=C top -bn1 | awk -F, '/^%Cpu/{for(i=1;i<=NF;i++) if($i ~ / id/){gsub(/[^0-9.]/,\"\",$i); print \"CPU \" 100-$i; exit}}'; "
+        "nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | awk '{print \"GPU \" $1}'"
     )
     code, out = _run(["ssh", *SSH_OPTS, "--", host, cmd], timeout=7)
     if code != 0:
         return None
     lines = [l.strip() for l in out.splitlines() if l.strip()]
     metrics: dict[str, Any] = {}
-    if lines:
-        parts = lines[0].split()
-        if len(parts) == 2 and all(p.isdigit() for p in parts):
-            metrics["memUsedMB"] = int(parts[0])
-            metrics["memTotalMB"] = int(parts[1])
-    if len(lines) > 1 and lines[1].lstrip("-").isdigit():
-        metrics["gpuUtilPct"] = int(lines[1])
+    for line in lines:
+        parts = line.split()
+        if len(parts) == 3 and parts[0] == "MEM" and all(p.replace(".", "", 1).isdigit() for p in parts[1:]):
+            metrics["memUsedMB"] = int(float(parts[1]))
+            metrics["memTotalMB"] = int(float(parts[2]))
+        elif len(parts) == 2 and parts[0] == "CPU":
+            try: metrics["cpuUtilPct"] = round(float(parts[1]), 1)
+            except ValueError: pass
+        elif include_gpu_util and len(parts) == 2 and parts[0] == "GPU":
+            try: metrics["gpuUtilPct"] = round(float(parts[1]), 1)
+            except ValueError: pass
     return metrics or None
+
+
+def _fetch_json(url: str) -> dict[str, Any] | None:
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(url, timeout=3.0) as resp:
+            data = json.loads(resp.read().decode() or "{}")
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _comfy_metrics(base_url: str) -> dict[str, Any] | None:
+    """Read workload state and unified GPU memory directly from ComfyUI."""
+    root = base_url.rstrip("/")
+    queue = _fetch_json(root + "/queue")
+    system = _fetch_json(root + "/system_stats")
+    metrics: dict[str, Any] = {"workloadSource": "comfyui"}
+    if queue is not None:
+        running = queue.get("queue_running")
+        pending = queue.get("queue_pending")
+        metrics["runningJobs"] = len(running) if isinstance(running, list) else 0
+        metrics["queuedJobs"] = len(pending) if isinstance(pending, list) else 0
+    if system is not None:
+        devices = system.get("devices")
+        if isinstance(devices, list) and devices and isinstance(devices[0], dict):
+            device = devices[0]
+            total = device.get("vram_total")
+            free = device.get("vram_free")
+            if isinstance(total, (int, float)) and isinstance(free, (int, float)) and total > 0:
+                metrics["gpuMemTotalMB"] = round(total / 1024 / 1024)
+                metrics["gpuMemUsedMB"] = round(max(0, total - free) / 1024 / 1024)
+    return metrics if len(metrics) > 1 else None
+
+
+def _llm_workload_metrics(base_url: str, kind: str = "openai", role: str | None = None) -> dict[str, Any]:
+    """Report whether an LLM service is ready and which models it is serving."""
+    root = base_url.rstrip("/")
+    metrics: dict[str, Any] = {"llmKind": kind}
+    if role:
+        metrics["llmRole"] = role
+    if kind == "ollama":
+        data = _fetch_json(root + "/api/ps")
+        if data is None:
+            return {**metrics, "llmReady": False, "llmModels": []}
+        rows = data.get("models")
+        rows = rows if isinstance(rows, list) else []
+        models = [str(row.get("name") or row.get("model")) for row in rows if isinstance(row, dict) and (row.get("name") or row.get("model"))]
+        vram = sum(
+            float(row.get("size_vram") or 0)
+            for row in rows
+            if isinstance(row, dict) and isinstance(row.get("size_vram"), (int, float))
+        )
+        metrics.update({"llmReady": True, "llmModels": models, "llmModelCount": len(models)})
+        if vram > 0:
+            metrics["llmMemUsedMB"] = round(vram / 1024 / 1024)
+        return metrics
+
+    data = _fetch_json(root + "/v1/models")
+    if data is None:
+        return {**metrics, "llmReady": False, "llmModels": []}
+    rows = data.get("data")
+    rows = rows if isinstance(rows, list) else []
+    models = [str(row["id"]) for row in rows if isinstance(row, dict) and row.get("id")]
+    metrics.update({"llmReady": True, "llmModels": models, "llmModelCount": len(models)})
+    return metrics
 
 
 def _vllm_metrics(base_url: str) -> dict[str, Any]:
@@ -156,7 +232,30 @@ def _probe_vllm_ssh(node: dict[str, Any]) -> dict[str, Any]:
         ssh_ok = code == 0
     infer_ok, models, latency = _http_models(node["baseURL"], node.get("modelsPath", "/v1/models"))
 
-    metrics = _ssh_metrics(host) if (host and ssh_ok) else None
+    metrics = (
+        _ssh_metrics(
+            host,
+            node.get("metricsCommand"),
+            include_gpu_util=node.get("gpuUtilReliable", True),
+        )
+        if (host and ssh_ok)
+        else None
+    )
+    if node.get("workloadURL"):
+        workload = _comfy_metrics(node["workloadURL"])
+        if workload:
+            metrics = {**(metrics or {}), **workload}
+    if node.get("llmURL"):
+        llm = _llm_workload_metrics(
+            node["llmURL"],
+            node.get("llmKind", "openai"),
+            node.get("llmRole"),
+        )
+        metrics = {**(metrics or {}), **llm}
+        if llm.get("llmReady"):
+            infer_ok = True
+            if llm.get("llmModels"):
+                models = llm["llmModels"]
     if infer_ok:
         vm = _vllm_metrics(node["baseURL"])
         if vm:
@@ -242,13 +341,26 @@ def _probe_lmlink_peer(node: dict[str, Any]) -> dict[str, Any]:
 
 def _probe_http_only(node: dict[str, Any]) -> dict[str, Any]:
     infer_ok, models, latency = _http_models(node["baseURL"], node.get("modelsPath", "/v1/models"))
+    metrics = None
+    if node.get("sshHost"):
+        code, _ = _run(["ssh", *SSH_OPTS, "--", node["sshHost"], "echo", "ok"], timeout=6)
+        if code == 0:
+            metrics = _ssh_metrics(
+                node["sshHost"],
+                node.get("metricsCommand"),
+                include_gpu_util=node.get("gpuUtilReliable", True),
+            )
+    if node.get("workloadURL"):
+        workload = _comfy_metrics(node["workloadURL"])
+        if workload:
+            metrics = {**(metrics or {}), **workload}
     return {
         "health": "online" if infer_ok else "offline",
         "models": models,
         "inferenceOK": infer_ok,
         "detail": "api" if infer_ok else "API not answering",
         "latencyMs": latency,
-        "metrics": None,
+        "metrics": metrics,
         "pathBadge": "API" if infer_ok else "DOWN",
     }
 
@@ -274,6 +386,22 @@ def _probe_one(node: dict[str, Any]) -> None:
             "metrics": None,
             "pathBadge": "?",
         }
+    # Pair mode is managed from the Mac mini scheduler, not from either GPU.
+    # A dedicated read-only command keeps the dashboard honest without
+    # inferring mode from an individual container.
+    if node.get("modeStatusCommand") and node.get("modeHost"):
+        code, out = _run(
+            ["ssh", *SSH_OPTS, "--", node["modeHost"], node["modeStatusCommand"]], timeout=20
+        )
+        try:
+            mode = json.loads(out)
+            if not isinstance(mode, dict):
+                raise ValueError("mode status was not an object")
+            result["mode"] = mode
+            label = str(mode.get("mode") or "unknown").upper()
+            result["detail"] = result.get("detail", "") + f" · mode {label}"
+        except Exception:
+            result["mode"] = {"mode": "unknown", "error": f"status command failed (exit {code})"}
     import collections
 
     now = time.time()
@@ -375,10 +503,39 @@ def snapshot(activity: dict[str, Any]) -> dict[str, Any]:
                 "canPing": bool(n.get("pingAlias")),
                 "canDoctor": bool(n.get("doctorCommand") and n.get("sshHost")),
                 "canControl": bool(n.get("container") and n.get("sshHost")),
+                "canModeControl": bool(n.get("modeCommands") and n.get("modeHost")),
+                "canProfileControl": bool(n.get("modelProfiles") and (n.get("profileHost") or n.get("sshHost"))),
+                "modelProfiles": sorted((n.get("modelProfiles") or {}).keys()),
+                "gatewayBackend": n.get("gatewayBackend"),
+                "gatewayAliases": list(n.get("litAliases") or []),
                 **st,
             }
         )
-    return {"title": fleet["title"], "links": fleet["links"], "nodes": nodes_out}
+    return {"title": fleet["title"], "links": _link_snapshot(fleet.get("links") or []), "nodes": nodes_out}
+
+
+def _link_snapshot(links: list[Any]) -> list[dict[str, Any]]:
+    """Return link state without declaring a physical fabric healthy by name.
+
+    A legacy [from, to] link is topology-only until a safe explicit probe is
+    configured. Object links may define checkHost/checkCommand; only that
+    declared command is executed over SSH.
+    """
+    output: list[dict[str, Any]] = []
+    for raw in links:
+        if isinstance(raw, list) and len(raw) == 2:
+            output.append({"from": raw[0], "to": raw[1], "health": "unverified", "detail": "topology only"})
+            continue
+        if not isinstance(raw, dict):
+            continue
+        entry = {"from": raw.get("from"), "to": raw.get("to"), "health": "unverified", "detail": "no link probe configured"}
+        host, command = raw.get("checkHost"), raw.get("checkCommand")
+        if isinstance(host, str) and isinstance(command, str) and host and command:
+            code, out = _run(["ssh", *SSH_OPTS, "--", host, command], timeout=10)
+            entry["health"] = "online" if code == 0 else "offline"
+            entry["detail"] = out.strip()[-160:] or ("link check passed" if code == 0 else f"link check failed ({code})")
+        output.append(entry)
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +550,7 @@ def _find_node(node_id: str) -> dict[str, Any] | None:
     return None
 
 
-def action_ping(node_id: str, gateway_port: int) -> dict[str, Any]:
+def action_ping(node_id: str, gateway_base_url: str, api_token: str) -> dict[str, Any]:
     """One-shot prompt through the gateway using the node's alias."""
     import urllib.request
 
@@ -409,9 +566,9 @@ def action_ping(node_id: str, gateway_port: int) -> dict[str, Any]:
         }
     ).encode()
     req = urllib.request.Request(
-        f"http://127.0.0.1:{gateway_port}/v1/chat/completions",
+        gateway_base_url.rstrip("/") + "/v1/chat/completions",
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_token}"},
         method="POST",
     )
     t0 = time.perf_counter()
@@ -478,3 +635,65 @@ def action_container(node_id: str, verb: str) -> dict[str, Any]:
         )
         return {"ok": True, "message": msg}
     return {"ok": False, "error": f"{verb} failed (exit {code}) {out.strip()[:120]}"}
+
+
+def action_mode(node_id: str, mode: str) -> dict[str, Any]:
+    """Switch a configured pair mode. Commands come only from fleet.json."""
+    node = _find_node(node_id)
+    commands = node.get("modeCommands") if node else None
+    host = node.get("modeHost") if node else None
+    if not node or not isinstance(commands, dict) or not host:
+        return {"ok": False, "error": "node has no mode controls"}
+    command = commands.get(mode)
+    if not isinstance(command, str) or not command:
+        return {"ok": False, "error": "unsupported mode"}
+    code, out = _run(["ssh", *SSH_OPTS, "--", host, command], timeout=1500)
+    if code != 0:
+        return {"ok": False, "error": f"{mode} mode failed (exit {code}) {out.strip()[-240:]}"}
+    return {"ok": True, "message": f"{mode} mode command completed", "detail": out.strip()[-240:]}
+
+
+def action_profile(node_id: str, profile_name: str) -> dict[str, Any]:
+    """Activate one explicitly configured model profile.
+
+    Profile commands are declared in fleet.json rather than supplied by the
+    browser. This prevents the dashboard from becoming arbitrary SSH access.
+    A profile can declare a rollback command for the operator to invoke after
+    a failed load; automatic rollback is intentionally only enabled when the
+    profile explicitly asks for it.
+    """
+    node = _find_node(node_id)
+    profiles = node.get("modelProfiles") if node else None
+    host = (node.get("profileHost") or node.get("sshHost")) if node else None
+    if not node or not isinstance(profiles, dict) or not isinstance(host, str):
+        return {"ok": False, "error": "node has no configured model profiles"}
+    profile = profiles.get(profile_name)
+    if not isinstance(profile, dict):
+        return {"ok": False, "error": "unknown model profile"}
+    command = profile.get("activateCommand")
+    if not isinstance(command, str) or not command:
+        return {"ok": False, "error": "profile has no activation command"}
+    timeout = min(max(int(profile.get("timeoutSec") or 900), 10), 1800)
+    code, out = _run(["ssh", *SSH_OPTS, "--", host, command], timeout=timeout)
+    if code != 0:
+        rollback = profile.get("rollbackCommand")
+        rolled_back = False
+        if profile.get("autoRollback") is True and isinstance(rollback, str) and rollback:
+            rb_code, _ = _run(["ssh", *SSH_OPTS, "--", host, rollback], timeout=timeout)
+            rolled_back = rb_code == 0
+        return {"ok": False, "error": f"profile activation failed (exit {code}) {out.strip()[-240:]}", "rolledBack": rolled_back}
+    verify = profile.get("verifyCommand")
+    if isinstance(verify, str) and verify:
+        verify_code, verify_out = _run(["ssh", *SSH_OPTS, "--", host, verify], timeout=min(timeout, 180))
+        if verify_code != 0:
+            rollback = profile.get("rollbackCommand")
+            rolled_back = False
+            if profile.get("autoRollback") is True and isinstance(rollback, str) and rollback:
+                rb_code, _ = _run(["ssh", *SSH_OPTS, "--", host, rollback], timeout=timeout)
+                rolled_back = rb_code == 0
+            return {
+                "ok": False,
+                "error": f"profile activated but smoke test failed (exit {verify_code}) {verify_out.strip()[-240:]}",
+                "rolledBack": rolled_back,
+            }
+    return {"ok": True, "message": f"profile {profile_name} activation completed", "detail": out.strip()[-240:]}

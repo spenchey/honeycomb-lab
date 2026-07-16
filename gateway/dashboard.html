@@ -237,6 +237,27 @@
   .trow .t-status.err { color: var(--red); }
   #trafficEmpty { padding: 14px 16px; color: var(--muted); font-size: 11px; }
 
+  /* ---------- Accounted telemetry ---------- */
+  #telemetry {
+    flex: 0 0 auto;
+    border-top: 1px solid var(--stroke);
+    background: var(--panel);
+  }
+  #alerts { border-top: 1px solid var(--stroke); padding: 8px 16px; display: none; gap: 8px; flex-wrap: wrap; }
+  #alerts.visible { display: flex; }
+  .alert { font-size: 10px; padding: 5px 7px; border: 1px solid #7d4e13; color: #ffd18b; background: rgba(125,78,19,.14); }
+  .alert.high { border-color: #8f2638; color: #ff9bad; background: rgba(143,38,56,.14); }
+  #telemetryHead {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 16px; min-height: 38px;
+    font-size: 10px; letter-spacing: 1.5px; color: var(--muted);
+  }
+  #telemetryList { display: flex; gap: 14px; overflow-x: auto; padding: 0 16px 9px; }
+  .telemetry-group { min-width: 175px; font-size: 10px; }
+  .telemetry-title { color: var(--green-dim); margin-bottom: 3px; letter-spacing: 1px; }
+  .telemetry-row { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; color: var(--text); }
+  .telemetry-row span:last-child { color: var(--muted); white-space: nowrap; }
+
   ::-webkit-scrollbar { width: 8px; height: 8px; }
   ::-webkit-scrollbar-thumb { background: var(--stroke); border-radius: 4px; }
   ::-webkit-scrollbar-track { background: transparent; }
@@ -284,6 +305,12 @@
     <div id="inspBody"></div>
   </div>
 </div>
+
+<div id="telemetry">
+  <div id="telemetryHead"><span>ACCOUNTED USAGE</span><span id="telemetryCount">REPORTED TOKENS ONLY</span></div>
+  <div id="telemetryList"></div>
+</div>
+<div id="alerts"></div>
 
 <div id="traffic">
   <div id="trafficHead">
@@ -344,6 +371,8 @@
   var trafficHead = document.getElementById("trafficHead");
   var trafficList = document.getElementById("trafficList");
   var trafficCount = document.getElementById("trafficCount");
+  var telemetryList = document.getElementById("telemetryList");
+  var alertsEl = document.getElementById("alerts");
 
   // ---------- Hex geometry helpers ----------
   function axialToPixel(q, r, s) {
@@ -852,8 +881,8 @@
     return btn;
   }
 
-  // ---------- Node control actions (ping / doctor / serve / stop) ----------
-  var actionState = {}; // node id -> {pingBusy,pingResult,doctorBusy,doctorResult,ctrlBusy,ctrlResult}
+  // ---------- Node control actions (ping / doctor / serve / stop / pair mode) ----------
+  var actionState = {}; // node id -> transient action state
   function getActionState(id) {
     if (!actionState[id]) actionState[id] = {};
     return actionState[id];
@@ -916,6 +945,23 @@
     });
   }
 
+  function doMode(id, mode, nodeName) {
+    if (!confirm("Switch " + (nodeName || id) + " to " + mode.toUpperCase() + " mode? This changes the paired Sparks and may take several minutes.")) return;
+    var as = getActionState(id);
+    if (as.modeBusy) return;
+    as.modeBusy = true;
+    refreshInspectorIfOpen(id);
+    postControl("/control/mode", { node: id, mode: mode }).then(function (res) {
+      as.modeBusy = false;
+      as.modeResult = res.data || { ok: false, error: "no response" };
+      refreshInspectorIfOpen(id);
+    }).catch(function () {
+      as.modeBusy = false;
+      as.modeResult = { ok: false, error: "network error" };
+      refreshInspectorIfOpen(id);
+    });
+  }
+
   function buildButtonRow(node) {
     var as = getActionState(node.id);
     var row = document.createElement("div");
@@ -932,6 +978,10 @@
     }
     if (node.canControl && node.inferenceOK) {
       row.appendChild(chipButton(as.ctrlBusy ? "STOP…" : "STOP", as.ctrlBusy, function () { doContainer(node.id, "stop", node.name); }, "red"));
+    }
+    if (node.canModeControl) {
+      row.appendChild(chipButton(as.modeBusy ? "SWITCHING…" : "DAY: DEEPSEEK", as.modeBusy, function () { doMode(node.id, "day", node.name); }, "green"));
+      row.appendChild(chipButton(as.modeBusy ? "SWITCHING…" : "NIGHT: MEDIA", as.modeBusy, function () { doMode(node.id, "media", node.name); }, "red"));
     }
     return row;
   }
@@ -960,6 +1010,9 @@
     addRow("PATH", node.pathBadge || "—");
     addRow("DETAIL", node.detail || "—");
     addRow("LATENCY", node.latencyMs != null ? Math.round(node.latencyMs) + " ms" : "—");
+    if (node.mode) {
+      addRow("PAIR MODE", String(node.mode.mode || "unknown").toUpperCase(), node.mode.mode === "deepseek" ? "online" : (node.mode.mode === "media" ? "degraded" : "unknown"));
+    }
 
     if (node.latencySeries && node.latencySeries.length > 4 && node.latencySeries.some(function (v) { return v > 0; })) {
       var trendRow = document.createElement("div");
@@ -980,7 +1033,14 @@
     if (m) {
       var mb = document.createElement("div");
       mb.className = "metric-block";
-      if (m.gpuUtilPct != null) mb.appendChild(buildBar("GPU", m.gpuUtilPct));
+      if (m.gpuUtilPct != null) mb.appendChild(buildBar("GPU NOW", m.gpuUtilPct));
+      if (m.gpuMemUsedMB != null && m.gpuMemTotalMB != null) {
+        var gpuUsedGB = (m.gpuMemUsedMB / 1024).toFixed(1);
+        var gpuTotalGB = (m.gpuMemTotalMB / 1024).toFixed(1);
+        var gpuMemPct = m.gpuMemTotalMB > 0 ? (m.gpuMemUsedMB / m.gpuMemTotalMB) * 100 : null;
+        mb.appendChild(buildBar("GPU MEMORY", gpuMemPct, gpuUsedGB + " / " + gpuTotalGB + " GB"));
+      }
+      if (m.cpuUtilPct != null) mb.appendChild(buildBar("CPU", m.cpuUtilPct));
       if (m.memUsedMB != null && m.memTotalMB != null) {
         var usedGB = (m.memUsedMB / 1024).toFixed(1);
         var totGB = (m.memTotalMB / 1024).toFixed(1);
@@ -988,6 +1048,40 @@
         mb.appendChild(buildBar("MEM", pct, usedGB + " / " + totGB + " GB"));
       }
       if (m.kvCachePct != null) mb.appendChild(buildBar("KV CACHE", m.kvCachePct));
+      if (m.runningJobs != null || m.queuedJobs != null) {
+        var jobsRow = document.createElement("div");
+        jobsRow.className = "row";
+        var jobsKey = document.createElement("span");
+        jobsKey.className = "k";
+        jobsKey.textContent = "MEDIA JOBS";
+        var jobsValue = document.createElement("span");
+        jobsValue.className = "v" + ((m.runningJobs || 0) > 0 ? " online" : "");
+        jobsValue.textContent = (m.runningJobs || 0) + " running · " + (m.queuedJobs || 0) + " queued";
+        jobsRow.appendChild(jobsKey);
+        jobsRow.appendChild(jobsValue);
+        mb.appendChild(jobsRow);
+      }
+      if (m.llmReady != null) {
+        var llmRow = document.createElement("div");
+        llmRow.className = "row";
+        var llmKey = document.createElement("span");
+        llmKey.className = "k";
+        llmKey.textContent = "LLM" + (m.llmRole ? " · " + String(m.llmRole).toUpperCase() : "");
+        var llmValue = document.createElement("span");
+        llmValue.className = "v" + (m.llmReady ? " online" : " offline");
+        var llmModels = Array.isArray(m.llmModels) ? m.llmModels : [];
+        llmValue.textContent = m.llmReady
+          ? ((node.lit ? "ACTIVE · " : "SERVING · ") + (llmModels.length ? truncMiddle(llmModels[0], 28) : "ready"))
+          : "OFF";
+        llmRow.appendChild(llmKey);
+        llmRow.appendChild(llmValue);
+        mb.appendChild(llmRow);
+      }
+      if (m.llmMemUsedMB != null && m.memTotalMB != null) {
+        var llmMemGB = (m.llmMemUsedMB / 1024).toFixed(1);
+        var llmMemPct = m.memTotalMB > 0 ? (m.llmMemUsedMB / m.memTotalMB) * 100 : null;
+        mb.appendChild(buildBar("LLM MEMORY", llmMemPct, llmMemGB + " GB"));
+      }
       if (m.genTokPerSec != null && m.genTokPerSec > 0.05) {
         var tokRow = document.createElement("div");
         tokRow.className = "row";
@@ -1017,7 +1111,7 @@
 
     // ---- Control buttons ----
     var as = getActionState(node.id);
-    if (node.canPing || node.canDoctor || node.canControl) {
+    if (node.canPing || node.canDoctor || node.canControl || node.canModeControl) {
       inspBody.appendChild(buildButtonRow(node));
     }
 
@@ -1045,6 +1139,14 @@
       cline.className = "result-line" + (cr.ok === false ? " err" : "");
       cline.textContent = "CTRL " + (cr.ok === false ? (cr.error || "failed") : (cr.message || "ok"));
       inspBody.appendChild(cline);
+    }
+
+    if (as.modeResult) {
+      var mr = as.modeResult;
+      var mline = document.createElement("div");
+      mline.className = "result-line" + (mr.ok === false ? " err" : "");
+      mline.textContent = "MODE " + (mr.ok === false ? (mr.error || "failed") : (mr.message || "ok"));
+      inspBody.appendChild(mline);
     }
 
     // ---- DOCTOR report (from a manual run, or the latest auto-run surfaced via /nodes) ----
@@ -1113,7 +1215,7 @@
 
       var alias = document.createElement("span");
       alias.className = "t-alias";
-      alias.textContent = r.alias || "—";
+      alias.textContent = (r.agent ? r.agent + " · " : "") + (r.alias || "—");
 
       var model = document.createElement("span");
       model.className = "t-model";
@@ -1144,6 +1246,53 @@
     });
   }
 
+  function renderTelemetry(telemetry) {
+    telemetryList.innerHTML = "";
+    var groups = [
+      ["AGENT / MODEL / DEVICE", telemetry && telemetry.by_agent_model_device],
+      ["AGENTS", telemetry && telemetry.by_agent],
+      ["MODELS", telemetry && telemetry.by_model],
+      ["DEVICES", telemetry && telemetry.by_device]
+    ];
+    groups.forEach(function (pair) {
+      var box = document.createElement("div");
+      box.className = "telemetry-group";
+      var title = document.createElement("div");
+      title.className = "telemetry-title";
+      title.textContent = pair[0];
+      box.appendChild(title);
+      var rows = Object.keys(pair[1] || {}).sort(function (a, b) {
+        return ((pair[1][b].prompt_tokens || 0) + (pair[1][b].completion_tokens || 0)) - ((pair[1][a].prompt_tokens || 0) + (pair[1][a].completion_tokens || 0));
+      });
+      if (!rows.length) {
+        var empty = document.createElement("div");
+        empty.className = "telemetry-row";
+        empty.textContent = "No gateway calls yet";
+        box.appendChild(empty);
+      }
+      rows.slice(0, 4).forEach(function (key) {
+        var rec = pair[1][key];
+        var row = document.createElement("div");
+        row.className = "telemetry-row";
+        var total = (rec.prompt_tokens || 0) + (rec.completion_tokens || 0);
+        row.innerHTML = "<span>" + truncEnd(key, 20) + "</span><span>" + total + " tok · " + (rec.requests || 0) + " req</span>";
+        box.appendChild(row);
+      });
+      telemetryList.appendChild(box);
+    });
+  }
+
+  function renderAlerts(alerts) {
+    alertsEl.innerHTML = "";
+    alertsEl.classList.toggle("visible", !!(alerts && alerts.length));
+    (alerts || []).forEach(function (alert) {
+      var item = document.createElement("div");
+      item.className = "alert " + (alert.severity || "medium");
+      item.textContent = (alert.severity || "notice").toUpperCase() + ": " + (alert.message || "Unknown alert");
+      alertsEl.appendChild(item);
+    });
+  }
+
   trafficHead.addEventListener("click", function () {
     trafficEl.classList.toggle("collapsed");
   });
@@ -1162,6 +1311,14 @@
       fetch("/requests", { cache: "no-store" }).then(function (r) {
         if (!r.ok) throw new Error("requests " + r.status);
         return r.json();
+      }),
+      fetch("/telemetry", { cache: "no-store" }).then(function (r) {
+        if (!r.ok) throw new Error("telemetry " + r.status);
+        return r.json();
+      }),
+      fetch("/alerts", { cache: "no-store" }).then(function (r) {
+        if (!r.ok) throw new Error("alerts " + r.status);
+        return r.json();
       })
     ]).then(function (results) {
       state.gatewayUp = true;
@@ -1172,6 +1329,8 @@
       mapWrap.classList.remove("down");
       renderMap(state.nodesData);
       renderTraffic(state.requestsData);
+      renderTelemetry((results[2] && results[2].telemetry) || {});
+      renderAlerts((results[3] && results[3].alerts) || []);
 
       if (state.inspectorOpen && state.selectedId) {
         var node = findNodeById(state.selectedId);
