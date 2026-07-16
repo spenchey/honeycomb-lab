@@ -1033,7 +1033,13 @@
     if (m) {
       var mb = document.createElement("div");
       mb.className = "metric-block";
-      if (m.gpuUtilPct != null) mb.appendChild(buildBar("GPU", m.gpuUtilPct));
+      if (m.gpuUtilPct != null) mb.appendChild(buildBar("GPU NOW", m.gpuUtilPct));
+      if (m.gpuMemUsedMB != null && m.gpuMemTotalMB != null) {
+        var gpuUsedGB = (m.gpuMemUsedMB / 1024).toFixed(1);
+        var gpuTotalGB = (m.gpuMemTotalMB / 1024).toFixed(1);
+        var gpuMemPct = m.gpuMemTotalMB > 0 ? (m.gpuMemUsedMB / m.gpuMemTotalMB) * 100 : null;
+        mb.appendChild(buildBar("GPU MEMORY", gpuMemPct, gpuUsedGB + " / " + gpuTotalGB + " GB"));
+      }
       if (m.cpuUtilPct != null) mb.appendChild(buildBar("CPU", m.cpuUtilPct));
       if (m.memUsedMB != null && m.memTotalMB != null) {
         var usedGB = (m.memUsedMB / 1024).toFixed(1);
@@ -1042,6 +1048,19 @@
         mb.appendChild(buildBar("MEM", pct, usedGB + " / " + totGB + " GB"));
       }
       if (m.kvCachePct != null) mb.appendChild(buildBar("KV CACHE", m.kvCachePct));
+      if (m.runningJobs != null || m.queuedJobs != null) {
+        var jobsRow = document.createElement("div");
+        jobsRow.className = "row";
+        var jobsKey = document.createElement("span");
+        jobsKey.className = "k";
+        jobsKey.textContent = "MEDIA JOBS";
+        var jobsValue = document.createElement("span");
+        jobsValue.className = "v" + ((m.runningJobs || 0) > 0 ? " online" : "");
+        jobsValue.textContent = (m.runningJobs || 0) + " running · " + (m.queuedJobs || 0) + " queued";
+        jobsRow.appendChild(jobsKey);
+        jobsRow.appendChild(jobsValue);
+        mb.appendChild(jobsRow);
+      }
       if (m.genTokPerSec != null && m.genTokPerSec > 0.05) {
         var tokRow = document.createElement("div");
         tokRow.className = "row";

@@ -11,6 +11,7 @@
       "hostname": "spark-abcd",
       "address": "192.168.1.50",
       "sshHost": "spark1",
+      "gpuUtilReliable": false,
       "gatewayBackend": "spark1",
       "pingAlias": "spark-main",
       "container": "my-vllm-container",

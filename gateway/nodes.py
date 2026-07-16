@@ -96,7 +96,11 @@ def _http_models(base_url: str, models_path: str) -> tuple[bool, list[str], floa
         return False, [], None
 
 
-def _ssh_metrics(host: str, custom_command: str | None = None) -> dict[str, Any] | None:
+def _ssh_metrics(
+    host: str,
+    custom_command: str | None = None,
+    include_gpu_util: bool = True,
+) -> dict[str, Any] | None:
     cmd = custom_command or (
         "free -m | awk '/^Mem:/{print \"MEM \" $3 \" \" $2}'; "
         "LC_ALL=C top -bn1 | awk -F, '/^%Cpu/{for(i=1;i<=NF;i++) if($i ~ / id/){gsub(/[^0-9.]/,\"\",$i); print \"CPU \" 100-$i; exit}}'; "
@@ -115,10 +119,44 @@ def _ssh_metrics(host: str, custom_command: str | None = None) -> dict[str, Any]
         elif len(parts) == 2 and parts[0] == "CPU":
             try: metrics["cpuUtilPct"] = round(float(parts[1]), 1)
             except ValueError: pass
-        elif len(parts) == 2 and parts[0] == "GPU":
+        elif include_gpu_util and len(parts) == 2 and parts[0] == "GPU":
             try: metrics["gpuUtilPct"] = round(float(parts[1]), 1)
             except ValueError: pass
     return metrics or None
+
+
+def _fetch_json(url: str) -> dict[str, Any] | None:
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(url, timeout=3.0) as resp:
+            data = json.loads(resp.read().decode() or "{}")
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _comfy_metrics(base_url: str) -> dict[str, Any] | None:
+    """Read workload state and unified GPU memory directly from ComfyUI."""
+    root = base_url.rstrip("/")
+    queue = _fetch_json(root + "/queue")
+    system = _fetch_json(root + "/system_stats")
+    metrics: dict[str, Any] = {"workloadSource": "comfyui"}
+    if queue is not None:
+        running = queue.get("queue_running")
+        pending = queue.get("queue_pending")
+        metrics["runningJobs"] = len(running) if isinstance(running, list) else 0
+        metrics["queuedJobs"] = len(pending) if isinstance(pending, list) else 0
+    if system is not None:
+        devices = system.get("devices")
+        if isinstance(devices, list) and devices and isinstance(devices[0], dict):
+            device = devices[0]
+            total = device.get("vram_total")
+            free = device.get("vram_free")
+            if isinstance(total, (int, float)) and isinstance(free, (int, float)) and total > 0:
+                metrics["gpuMemTotalMB"] = round(total / 1024 / 1024)
+                metrics["gpuMemUsedMB"] = round(max(0, total - free) / 1024 / 1024)
+    return metrics if len(metrics) > 1 else None
 
 
 def _vllm_metrics(base_url: str) -> dict[str, Any]:
@@ -161,7 +199,19 @@ def _probe_vllm_ssh(node: dict[str, Any]) -> dict[str, Any]:
         ssh_ok = code == 0
     infer_ok, models, latency = _http_models(node["baseURL"], node.get("modelsPath", "/v1/models"))
 
-    metrics = _ssh_metrics(host, node.get("metricsCommand")) if (host and ssh_ok) else None
+    metrics = (
+        _ssh_metrics(
+            host,
+            node.get("metricsCommand"),
+            include_gpu_util=node.get("gpuUtilReliable", True),
+        )
+        if (host and ssh_ok)
+        else None
+    )
+    if node.get("workloadURL"):
+        workload = _comfy_metrics(node["workloadURL"])
+        if workload:
+            metrics = {**(metrics or {}), **workload}
     if infer_ok:
         vm = _vllm_metrics(node["baseURL"])
         if vm:
@@ -251,7 +301,15 @@ def _probe_http_only(node: dict[str, Any]) -> dict[str, Any]:
     if node.get("sshHost"):
         code, _ = _run(["ssh", *SSH_OPTS, "--", node["sshHost"], "echo", "ok"], timeout=6)
         if code == 0:
-            metrics = _ssh_metrics(node["sshHost"], node.get("metricsCommand"))
+            metrics = _ssh_metrics(
+                node["sshHost"],
+                node.get("metricsCommand"),
+                include_gpu_util=node.get("gpuUtilReliable", True),
+            )
+    if node.get("workloadURL"):
+        workload = _comfy_metrics(node["workloadURL"])
+        if workload:
+            metrics = {**(metrics or {}), **workload}
     return {
         "health": "online" if infer_ok else "offline",
         "models": models,
